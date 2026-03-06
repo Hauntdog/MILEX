@@ -335,9 +335,19 @@ TOOL_DEFINITIONS = [
 class ToolExecutor:
     """Executes tool calls and returns results."""
 
-    def __init__(self, auto_execute: bool = False, confirm_callback=None):
+    def __init__(
+        self,
+        config: dict,
+        ui: Optional["AgentUI"] = None,
+        rag: Optional["RagManager"] = None,
+        agent: Optional["MilexAgent"] = None,
+        auto_execute: bool = False,
+    ):
+        self.config = config
+        self.ui = ui
+        self.rag = rag
+        self.agent = agent
         self.auto_execute = auto_execute
-        self.confirm_callback = confirm_callback  # fn(tool_name, args) -> bool
 
     def execute(self, tool_name: str, args: Dict[str, Any]) -> Dict[str, Any]:
         """Dispatch to the appropriate tool handler."""
@@ -364,9 +374,16 @@ class ToolExecutor:
             return {"error": f"Unknown tool: {tool_name}"}
 
         # Dangerous tools need confirmation
-        dangerous = {"run_shell", "delete_path", "write_file", "append_file", "copy_path", "move_path"}
+        dangerous = {
+            "run_shell",
+            "delete_path",
+            "write_file",
+            "append_file",
+            "copy_path",
+            "move_path",
+        }
         if tool_name in dangerous and not self.auto_execute:
-            if self.confirm_callback and not self.confirm_callback(tool_name, args):
+            if self.ui and not self.ui.confirm_tool(tool_name, args):
                 return {"status": "cancelled", "message": "User cancelled execution"}
 
         try:
@@ -374,8 +391,13 @@ class ToolExecutor:
         except Exception as e:
             return {"error": str(e)}
 
-    def _run_shell(self, command: str, cwd: Optional[str] = None, timeout: int = 30) -> dict:
+    def _run_shell(
+        self, command: str, cwd: Optional[str] = None, timeout: int = 30
+    ) -> dict:
         try:
+            if cwd:
+                _validate_path(cwd, must_exist=True)
+
             # Try list-based execution first (safer)
             try:
                 cmd_list = shlex.split(command)
@@ -414,7 +436,9 @@ class ToolExecutor:
         except (PermissionError, FileNotFoundError) as e:
             return {"error": str(e)}
         if p.stat().st_size > MAX_READ_BYTES:
-            return {"error": f"File too large ({p.stat().st_size} bytes, max {MAX_READ_BYTES})"}
+            return {
+                "error": f"File too large ({p.stat().st_size} bytes, max {MAX_READ_BYTES})"
+            }
         content = p.read_text(errors="replace")
         return {"content": content, "size": p.stat().st_size}
 
@@ -471,9 +495,11 @@ class ToolExecutor:
     ) -> dict:
         import fnmatch
 
-        root = Path(path).expanduser()
-        if not root.exists():
-            return {"error": f"Path not found: {path}"}
+        try:
+            root = _validate_path(path, must_exist=True)
+        except (PermissionError, FileNotFoundError) as e:
+            return {"error": str(e)}
+
         matches = []
         for f in root.rglob("*"):
             if not f.is_file():
@@ -518,7 +544,10 @@ class ToolExecutor:
             }
 
     def _create_directory(self, path: str) -> dict:
-        p = Path(path).expanduser()
+        try:
+            p = _validate_path(path)
+        except PermissionError as e:
+            return {"error": str(e)}
         p.mkdir(parents=True, exist_ok=True)
         return {"success": True, "path": str(p.resolve())}
 
@@ -542,11 +571,8 @@ class ToolExecutor:
     def _copy_path(self, src: str, dst: str) -> dict:
         try:
             s = _validate_path(src, must_exist=True)
-        except (PermissionError, FileNotFoundError) as e:
-            return {"error": str(e)}
-        try:
             d = _validate_path(dst)
-        except PermissionError as e:
+        except (PermissionError, FileNotFoundError) as e:
             return {"error": str(e)}
         if s.is_dir():
             shutil.copytree(s, d)
@@ -557,16 +583,13 @@ class ToolExecutor:
     def _move_path(self, src: str, dst: str) -> dict:
         try:
             s = _validate_path(src, must_exist=True)
+            d = _validate_path(dst)
         except (PermissionError, FileNotFoundError) as e:
             return {"error": str(e)}
-        try:
-            d = _validate_path(dst)
-        except PermissionError as e:
-            return {"error": str(e)}
-        
+
         # Ensure parent directory of destination exists
         d.parent.mkdir(parents=True, exist_ok=True)
-        
+
         shutil.move(s, d)
         return {"success": True, "src": str(s), "dst": str(d)}
 
@@ -592,13 +615,18 @@ class ToolExecutor:
     def _generate_code(
         self, task: str, language: str, filename: Optional[str] = None
     ) -> dict:
-        # This is handled at the agent level; here we just return a marker
-        return {"_generate_code": True, "task": task, "language": language, "filename": filename}
+        if not self.agent:
+            return {"error": "Code generation requires a running agent instance"}
+        return self.agent.generate_code_internal(task, language, filename)
 
     def _rag_index(self, path: str = ".") -> dict:
-        # Handled by agent's RagManager
-        return {"_rag_index": True, "path": path}
+        if not self.rag:
+            return {"error": "RAG is disabled"}
+        self.rag.index_directory(path)
+        return {"success": True, "path": path, "chunks": len(self.rag.chunks)}
 
     def _rag_search(self, query: str, count: int = 5) -> dict:
-        # Handled by agent's RagManager
-        return {"_rag_search": True, "query": query, "count": count}
+        if not self.rag:
+            return {"error": "RAG is disabled"}
+        results = self.rag.search(query, top_k=count)
+        return {"results": results, "count": len(results)}

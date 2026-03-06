@@ -76,6 +76,109 @@ def print_welcome(model: str, host: str):
     console.print(Panel(table, border_style="dim cyan", title="[dim cyan]● connected[/]", title_align="right"))
 
 
+# ─── UI Interfaces ───────────────────────────────────────────────────────────
+
+
+class AgentUI:
+    """Abstract base class for AI agent UI handlers."""
+
+    def print_ai_message(self, text: str, model: str = "MILEX"):
+        raise NotImplementedError
+
+    def print_tool_call(self, tool_name: str, args: dict):
+        raise NotImplementedError
+
+    def print_tool_result(self, tool_name: str, result: dict, success: bool = True):
+        raise NotImplementedError
+
+    def print_error(self, message: str):
+        raise NotImplementedError
+
+    def print_success(self, message: str):
+        raise NotImplementedError
+
+    def print_warning(self, message: str):
+        raise NotImplementedError
+
+    def print_info(self, message: str):
+        raise NotImplementedError
+
+    def confirm_tool(self, tool_name: str, args: dict) -> bool:
+        raise NotImplementedError
+
+    def create_stream_renderer(self, model: str = "MILEX"):
+        raise NotImplementedError
+
+    def create_thinking_spinner(self, message: str = "Thinking..."):
+        raise NotImplementedError
+
+    def print_code_block(self, code: str, language: str = "python", filename: Optional[str] = None):
+        raise NotImplementedError
+
+    def ask_save_file(self, code: str, language: str) -> Optional[str]:
+        raise NotImplementedError
+
+    def ask_run_command(self, filename: str) -> bool:
+        raise NotImplementedError
+
+
+class RichUI(AgentUI):
+    """Rich-based implementation of the Agent UI."""
+
+    def __init__(self, console_obj=None):
+        self.console = console_obj or console
+
+    def print_ai_message(self, text: str, model: str = "MILEX"):
+        print_ai_message(text, model)
+
+    def print_tool_call(self, tool_name: str, args: dict):
+        print_tool_call(tool_name, args)
+
+    def print_tool_result(self, tool_name: str, result: dict, success: bool = True):
+        print_tool_result(tool_name, result, success)
+
+    def print_error(self, message: str):
+        print_error(message)
+
+    def print_success(self, message: str):
+        print_success(message)
+
+    def print_warning(self, message: str):
+        print_warning(message)
+
+    def print_info(self, message: str):
+        print_info(message)
+
+    def confirm_tool(self, tool_name: str, args: dict) -> bool:
+        return confirm_tool_execution(tool_name, args)
+
+    def create_stream_renderer(self, model: str = "MILEX"):
+        return StreamRenderer(model=model)
+
+    def create_thinking_spinner(self, message: str = "Thinking..."):
+        return ThinkingSpinner(message=message)
+
+    def print_code_block(self, code: str, language: str = "python", filename: Optional[str] = None):
+        print_code_block(code, language, filename)
+
+    def ask_save_file(self, code: str, language: str) -> Optional[str]:
+        self.console.print(
+            f"\n[dim cyan]💾 Save this [bold]{language}[/] code block to a file? "
+            f"(Enter filename or press Enter to skip)[/]"
+        )
+        try:
+            filename = Prompt.ask("[dim cyan]Filename[/]", default="")
+            return filename.strip() if filename.strip() else None
+        except (KeyboardInterrupt, EOFError):
+            return None
+
+    def ask_run_command(self, filename: str) -> bool:
+        try:
+            return Confirm.ask(f"\n[dim cyan]▶ Run [bold]{filename}[/]?[/]", default=False)
+        except (KeyboardInterrupt, EOFError):
+            return False
+
+
 # ─── Message Rendering ────────────────────────────────────────────────────────
 
 

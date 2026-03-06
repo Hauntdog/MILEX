@@ -31,6 +31,7 @@ from .config import (
     save_history,
 )
 from .ui import (
+    RichUI,
     console,
     print_banner,
     print_code_block,
@@ -448,7 +449,7 @@ def handle_slash_command(cmd: str, agent: MilexAgent) -> bool:
     Handle slash commands.
     Returns True if the main loop should continue, False to exit.
     """
-    parts   = cmd.strip().split(maxsplit=2)
+    parts = cmd.strip().split(maxsplit=2)
     command = parts[0].lower()
 
     if command in ("/exit", "/quit"):
@@ -481,15 +482,12 @@ def handle_slash_command(cmd: str, agent: MilexAgent) -> bool:
             print_error("Usage: /set <key> <value>")
         else:
             key, value = parts[1], parts[2]
-            
-            # Remove any trailing comments (everything starting with #)
             if "#" in value:
                 value = value.split("#")[0]
-            # Strip multiple lines if user accidentally pasted multiple commands
             value = value.split("\n")[0].strip()
 
             if value.lower() in ("true", "yes"):
-                typed: object = True
+                typed = True
             elif value.lower() in ("false", "no"):
                 typed = False
             else:
@@ -507,9 +505,14 @@ def handle_slash_command(cmd: str, agent: MilexAgent) -> bool:
     elif command == "/auto":
         if len(parts) < 2:
             current = agent.config.get("auto_execute", False)
-            agent.set_auto_execute(not current)
+            val = not current
         else:
-            agent.set_auto_execute(parts[1].lower() in ("on", "true", "1", "yes"))
+            val = parts[1].lower() in ("on", "true", "1", "yes")
+        agent.config["auto_execute"] = val
+        agent.executor.auto_execute = val
+        save_config(agent.config)
+        state = "[green]ON[/]" if val else "[red]OFF[/]"
+        print_info(f"Auto-execute: {state}")
 
     elif command == "/history":
         history = load_history()
@@ -540,9 +543,6 @@ def handle_slash_command(cmd: str, agent: MilexAgent) -> bool:
     elif command == "/code":
         if len(parts) < 3:
             print_error("Usage: /code <language> <task description>")
-            print_info("Example: /code python write a web scraper for HackerNews")
-            print_info("Example: /code javascript create a REST API with Express")
-            print_info("Example: /code bash backup home directory to /tmp")
         else:
             lang = parts[1]
             rest = parts[2]
@@ -550,15 +550,16 @@ def handle_slash_command(cmd: str, agent: MilexAgent) -> bool:
             save_match = re.search(r"--save\s+(\S+)", rest)
             if save_match:
                 filename = save_match.group(1)
-                rest     = rest.replace(save_match.group(0), "").strip()
-            agent._handle_generate_code({"task": rest, "language": lang, "filename": filename})
+                rest = rest.replace(save_match.group(0), "").strip()
+            # New internal call
+            agent.generate_code_internal(rest, lang, filename)
 
     elif command == "/run":
         if len(parts) < 2:
             print_error("Usage: /run <shell command>")
         else:
             shell_cmd = cmd[len("/run"):].strip()
-            result    = agent.executor.execute("run_shell", {"command": shell_cmd})
+            result = agent.executor.execute("run_shell", {"command": shell_cmd})
             if result.get("stdout"):
                 console.print(result["stdout"])
             if result.get("stderr"):
@@ -752,7 +753,8 @@ def main(
 
         cfg = load_config()
         try:
-            agent = MilexAgent(config=cfg)
+            ui = RichUI()
+            agent = MilexAgent(config=cfg, ui=ui)
         except Exception as e:
             with open(str(DAEMON_LOG), "a") as lf:
                 lf.write(f"[daemon] Failed to init agent: {e}\n")
@@ -788,7 +790,8 @@ def main(
     print_banner()
 
     try:
-        agent = MilexAgent(config=cfg)
+        ui = RichUI()
+        agent = MilexAgent(config=cfg, ui=ui)
     except Exception as e:
         print_error(f"Failed to initialize agent: {e}")
         raise typer.Exit(1)
@@ -828,7 +831,8 @@ def start_daemon(
         cfg["auto_execute"] = True
 
     try:
-        agent = MilexAgent(config=cfg)
+        ui = RichUI()
+        agent = MilexAgent(config=cfg, ui=ui)
     except Exception as e:
         with open(str(DAEMON_LOG), "a") as lf:
             lf.write(f"[daemon] Failed to init agent: {e}\n")
@@ -885,7 +889,8 @@ def list_models():
     """List available Ollama models."""
     cfg = load_config()
     try:
-        agent = MilexAgent(config=cfg)
+        ui = RichUI()
+        agent = MilexAgent(config=cfg, ui=ui)
     except Exception as e:
         print_error(f"Failed to initialize agent: {e}")
         raise typer.Exit(1)
