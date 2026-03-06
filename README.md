@@ -100,11 +100,13 @@ milex --auto
 | `run_shell` | Execute shell commands |
 | `read_file` | Read file contents |
 | `write_file` | Write/create files |
+| `append_file` | Append content to a file |
 | `list_directory` | List directory contents |
 | `search_files` | Search files by name/content |
 | `create_directory` | Create directories |
 | `delete_path` | Delete files/directories |
 | `copy_path` | Copy files/directories |
+| `move_path` | Move or rename files/directories |
 | `open_browser` | Open URLs in browser |
 | `clipboard_copy` | Copy text to clipboard |
 | `get_system_info` | Get system information |

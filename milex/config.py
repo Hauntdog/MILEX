@@ -46,7 +46,7 @@ DEFAULT_CONFIG = {
         "CORE CAPABILITIES:\n"
         "- Generate complete, production-ready code in ANY programming language.\n"
         "- Execute shell commands and manage system processes.\n"
-        "- Full filesystem access: read, write, list, search, and manage files/directories.\n"
+        "- Full filesystem access: read, write, append, move, rename, and manage files/directories.\n"
         "- Semantic Search (RAG): Index your projects and search for relevant code/docs semanticially using 'rag_index' and 'rag_search'.\n"
         "- Desktop automation: open web browser, manage clipboard, etc.\n\n"
         "OPERATIONAL RULES:\n"

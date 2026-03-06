@@ -16,19 +16,18 @@ MAX_READ_BYTES = 1 * 1024 * 1024  # 1 MB
 
 
 def _validate_path(path_str: str, must_exist: bool = False) -> Path:
-    """Resolve and validate a path is within the allowed root (if set) or CWD."""
+    """Resolve and validate a path is within the allowed root (if set)."""
     p = Path(path_str).expanduser().resolve()
-    root = (_ALLOWED_ROOT or Path.cwd()).resolve()
-
-    # is_relative_to is Python 3.9+; we're on 3.9+ as per pyproject.toml
-    try:
-        if not p.is_relative_to(root):
-            raise PermissionError(f"Path '{p}' is outside the allowed root '{root}'")
-    except (AttributeError, ValueError):
-        # Fallback for older versions or slightly different behavior
-        if not (str(p) == str(root) or str(p).startswith(str(root) + os.sep)):
-            raise PermissionError(f"Path '{p}' is outside the allowed root '{root}'")
-
+    
+    if _ALLOWED_ROOT:
+        root = _ALLOWED_ROOT.resolve()
+        try:
+            if not p.is_relative_to(root):
+                raise PermissionError(f"Path '{p}' is outside the allowed root '{root}'")
+        except (AttributeError, ValueError):
+            if not (str(p) == str(root) or str(p).startswith(str(root) + os.sep)):
+                raise PermissionError(f"Path '{p}' is outside the allowed root '{root}'")
+    
     if must_exist and not p.exists():
         raise FileNotFoundError(f"Path not found: {path_str}")
     return p
@@ -94,6 +93,24 @@ TOOL_DEFINITIONS = [
                     "content": {
                         "type": "string",
                         "description": "Content to write",
+                    },
+                },
+                "required": ["path", "content"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "append_file",
+            "description": "Append content to the end of a file.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Path to file"},
+                    "content": {
+                        "type": "string",
+                        "description": "Content to append",
                     },
                 },
                 "required": ["path", "content"],
@@ -191,6 +208,21 @@ TOOL_DEFINITIONS = [
         "function": {
             "name": "copy_path",
             "description": "Copy a file or directory.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "src": {"type": "string", "description": "Source path"},
+                    "dst": {"type": "string", "description": "Destination path"},
+                },
+                "required": ["src", "dst"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "move_path",
+            "description": "Move or rename a file or directory.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -313,12 +345,14 @@ class ToolExecutor:
             "run_shell": self._run_shell,
             "read_file": self._read_file,
             "write_file": self._write_file,
+            "append_file": self._append_file,
             "list_directory": self._list_directory,
             "search_files": self._search_files,
             "get_system_info": self._get_system_info,
             "create_directory": self._create_directory,
             "delete_path": self._delete_path,
             "copy_path": self._copy_path,
+            "move_path": self._move_path,
             "open_browser": self._open_browser,
             "clipboard_copy": self._clipboard_copy,
             "generate_code": self._generate_code,
@@ -330,7 +364,7 @@ class ToolExecutor:
             return {"error": f"Unknown tool: {tool_name}"}
 
         # Dangerous tools need confirmation
-        dangerous = {"run_shell", "delete_path", "write_file", "copy_path"}
+        dangerous = {"run_shell", "delete_path", "write_file", "append_file", "copy_path", "move_path"}
         if tool_name in dangerous and not self.auto_execute:
             if self.confirm_callback and not self.confirm_callback(tool_name, args):
                 return {"status": "cancelled", "message": "User cancelled execution"}
@@ -392,6 +426,16 @@ class ToolExecutor:
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(content)
         return {"success": True, "path": str(p), "bytes_written": len(content)}
+
+    def _append_file(self, path: str, content: str) -> dict:
+        try:
+            p = _validate_path(path)
+        except PermissionError as e:
+            return {"error": str(e)}
+        p.parent.mkdir(parents=True, exist_ok=True)
+        with open(p, "a") as f:
+            f.write(content)
+        return {"success": True, "path": str(p), "bytes_appended": len(content)}
 
     def _list_directory(self, path: str = ".", recursive: bool = False) -> dict:
         try:
@@ -508,6 +552,22 @@ class ToolExecutor:
             shutil.copytree(s, d)
         else:
             shutil.copy2(s, d)
+        return {"success": True, "src": str(s), "dst": str(d)}
+
+    def _move_path(self, src: str, dst: str) -> dict:
+        try:
+            s = _validate_path(src, must_exist=True)
+        except (PermissionError, FileNotFoundError) as e:
+            return {"error": str(e)}
+        try:
+            d = _validate_path(dst)
+        except PermissionError as e:
+            return {"error": str(e)}
+        
+        # Ensure parent directory of destination exists
+        d.parent.mkdir(parents=True, exist_ok=True)
+        
+        shutil.move(s, d)
         return {"success": True, "src": str(s), "dst": str(d)}
 
     def _open_browser(self, url: str) -> dict:
