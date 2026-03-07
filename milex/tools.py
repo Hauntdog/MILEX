@@ -1,26 +1,35 @@
-"""Computer control tools for MILEX CLI."""
-import json
+import asyncio
+import importlib.util
 import os
 import platform
 import shlex
 import shutil
 import subprocess
 import sys
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple, Callable
 
 # ─── Module-level security constants & helpers ───────────────────────────────
 
-_ALLOWED_ROOT: Optional[Path] = None  # Set to restrict operations to a root dir
 MAX_READ_BYTES = 1 * 1024 * 1024  # 1 MB
 
+# Set of dangerous tool names that require confirmation
+DANGEROUS_TOOLS = frozenset({
+    "run_shell",
+    "delete_path",
+    "copy_path",
+    "move_path",
+})
 
-def _validate_path(path_str: str, must_exist: bool = False) -> Path:
+
+def _validate_path(path_str: str, config: dict, must_exist: bool = False) -> Path:
     """Resolve and validate a path is within the allowed root (if set)."""
     p = Path(path_str).expanduser().resolve()
     
-    if _ALLOWED_ROOT:
-        root = _ALLOWED_ROOT.resolve()
+    allowed_root_str = config.get("allowed_root")
+    if allowed_root_str:
+        root = Path(allowed_root_str).resolve()
         try:
             if not p.is_relative_to(root):
                 raise PermissionError(f"Path '{p}' is outside the allowed root '{root}'")
@@ -96,6 +105,43 @@ TOOL_DEFINITIONS = [
                     },
                 },
                 "required": ["path", "content"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "edit_file",
+            "description": (
+                "Edit an existing file by performing targeted find-and-replace operations. "
+                "Use this instead of write_file when you only need to change specific parts "
+                "of a file. Each edit specifies old_text to find and new_text to replace it with. "
+                "If old_text is empty, new_text is inserted at the beginning of the file."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Path to the file to edit"},
+                    "edits": {
+                        "type": "array",
+                        "description": "List of edit operations",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "old_text": {
+                                    "type": "string",
+                                    "description": "Exact text to find (empty string = insert at top)",
+                                },
+                                "new_text": {
+                                    "type": "string",
+                                    "description": "Replacement text",
+                                },
+                            },
+                            "required": ["old_text", "new_text"],
+                        },
+                    },
+                },
+                "required": ["path", "edits"],
             },
         },
     },
@@ -348,6 +394,38 @@ class ToolExecutor:
         self.rag = rag
         self.agent = agent
         self.auto_execute = auto_execute
+        self.plugins: Dict[str, Callable] = {}
+        self._load_plugins()
+
+    def _load_plugins(self):
+        """Dynamic plugin discovery."""
+        plugin_dir = self.config.get("plugin_dir")
+        if not plugin_dir: return
+        
+        path = Path(plugin_dir).expanduser()
+        if not path.exists():
+            path.mkdir(parents=True, exist_ok=True)
+            return
+
+        for py_file in path.glob("*.py"):
+            try:
+                name = py_file.stem
+                spec = importlib.util.spec_from_file_location(name, str(py_file))
+                if not spec or not spec.loader: continue
+                module = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(module)
+                
+                if hasattr(module, "TOOL_DEFINITION") and hasattr(module, "handler"):
+                    # Add to definitions (used by model)
+                    TOOL_DEFINITIONS.append(module.TOOL_DEFINITION)
+                    # Register handler
+                    self.plugins[module.TOOL_DEFINITION["function"]["name"]] = module.handler
+            except Exception as e:
+                if self.ui: self.ui.print_warning(f"Plugin load error ({py_file.name}): {e}")
+
+    async def execute_async(self, tool_name: str, args: Dict[str, Any]) -> Dict[str, Any]:
+        """Wrap execute in a thread to keep main loop free."""
+        return await asyncio.to_thread(self.execute, tool_name, args)
 
     def execute(self, tool_name: str, args: Dict[str, Any]) -> Dict[str, Any]:
         """Dispatch to the appropriate tool handler."""
@@ -355,6 +433,7 @@ class ToolExecutor:
             "run_shell": self._run_shell,
             "read_file": self._read_file,
             "write_file": self._write_file,
+            "edit_file": self._edit_file,
             "append_file": self._append_file,
             "list_directory": self._list_directory,
             "search_files": self._search_files,
@@ -369,25 +448,31 @@ class ToolExecutor:
             "rag_index": self._rag_index,
             "rag_search": self._rag_search,
         }
+
+        # Merge with plugins
+        handlers.update(self.plugins)
+
         handler = handlers.get(tool_name)
         if not handler:
             return {"error": f"Unknown tool: {tool_name}"}
 
         # Dangerous tools need confirmation
-        dangerous = {
-            "run_shell",
-            "delete_path",
-            "write_file",
-            "append_file",
-            "copy_path",
-            "move_path",
-        }
-        if tool_name in dangerous and not self.auto_execute:
+        # Plugins can be dangerous, so they default to dangerous
+        # Only truly destructive ops need confirmation.
+        # File writes are auto-approved (like Gemini CLI) so the bot
+        # can save files on its own without prompting every time.
+        is_plugin = tool_name in self.plugins
+
+        if (tool_name in DANGEROUS_TOOLS or is_plugin) and not self.auto_execute:
             if self.ui and not self.ui.confirm_tool(tool_name, args):
                 return {"status": "cancelled", "message": "User cancelled execution"}
 
         try:
-            return handler(**args)
+            if is_plugin:
+                # Plugin API: handler(args_dict, *, config, ui, executor)
+                return handler(args, config=self.config, ui=self.ui, executor=self)
+            else:
+                return handler(**args)
         except Exception as e:
             return {"error": str(e)}
 
@@ -396,7 +481,7 @@ class ToolExecutor:
     ) -> dict:
         try:
             if cwd:
-                _validate_path(cwd, must_exist=True)
+                _validate_path(cwd, self.config, must_exist=True)
 
             # Try list-based execution first (safer)
             try:
@@ -432,7 +517,7 @@ class ToolExecutor:
 
     def _read_file(self, path: str) -> dict:
         try:
-            p = _validate_path(path, must_exist=True)
+            p = _validate_path(path, self.config, must_exist=True)
         except (PermissionError, FileNotFoundError) as e:
             return {"error": str(e)}
         if p.stat().st_size > MAX_READ_BYTES:
@@ -444,7 +529,7 @@ class ToolExecutor:
 
     def _write_file(self, path: str, content: str) -> dict:
         try:
-            p = _validate_path(path)
+            p = _validate_path(path, self.config)
         except PermissionError as e:
             return {"error": str(e)}
         p.parent.mkdir(parents=True, exist_ok=True)
@@ -453,7 +538,7 @@ class ToolExecutor:
 
     def _append_file(self, path: str, content: str) -> dict:
         try:
-            p = _validate_path(path)
+            p = _validate_path(path, self.config)
         except PermissionError as e:
             return {"error": str(e)}
         p.parent.mkdir(parents=True, exist_ok=True)
@@ -461,9 +546,49 @@ class ToolExecutor:
             f.write(content)
         return {"success": True, "path": str(p), "bytes_appended": len(content)}
 
+    def _edit_file(self, path: str, edits: list) -> dict:
+        """Apply targeted find-and-replace edits to a file."""
+        try:
+            p = _validate_path(path, self.config, must_exist=True)
+        except (PermissionError, FileNotFoundError) as e:
+            return {"error": str(e)}
+
+        content = p.read_text(errors="replace")
+        applied = 0
+        failed = []
+
+        for i, edit in enumerate(edits):
+            old_text = edit.get("old_text", "")
+            new_text = edit.get("new_text", "")
+
+            if not old_text:
+                # Empty old_text → insert at beginning
+                content = new_text + content
+                applied += 1
+            elif old_text in content:
+                content = content.replace(old_text, new_text, 1)
+                applied += 1
+            else:
+                failed.append({
+                    "edit_index": i,
+                    "old_text_preview": old_text[:80],
+                    "reason": "old_text not found in file",
+                })
+
+        p.write_text(content)
+        result = {
+            "success": True,
+            "path": str(p),
+            "edits_applied": applied,
+            "edits_failed": len(failed),
+        }
+        if failed:
+            result["failures"] = failed
+        return result
+
     def _list_directory(self, path: str = ".", recursive: bool = False) -> dict:
         try:
-            p = _validate_path(path, must_exist=True)
+            p = _validate_path(path, self.config, must_exist=True)
         except (PermissionError, FileNotFoundError) as e:
             return {"error": str(e)}
 
@@ -496,7 +621,7 @@ class ToolExecutor:
         import fnmatch
 
         try:
-            root = _validate_path(path, must_exist=True)
+            root = _validate_path(path, self.config, must_exist=True)
         except (PermissionError, FileNotFoundError) as e:
             return {"error": str(e)}
 
@@ -545,7 +670,7 @@ class ToolExecutor:
 
     def _create_directory(self, path: str) -> dict:
         try:
-            p = _validate_path(path)
+            p = _validate_path(path, self.config)
         except PermissionError as e:
             return {"error": str(e)}
         p.mkdir(parents=True, exist_ok=True)
@@ -553,10 +678,13 @@ class ToolExecutor:
 
     def _delete_path(self, path: str, recursive: bool = False) -> dict:
         try:
-            p = _validate_path(path, must_exist=True)
+            p = _validate_path(path, self.config, must_exist=True)
         except (PermissionError, FileNotFoundError) as e:
             return {"error": str(e)}
-        root = (_ALLOWED_ROOT or Path.cwd()).resolve()
+        
+        allowed_root_str = self.config.get("allowed_root")
+        root = Path(allowed_root_str or Path.cwd()).resolve()
+        
         if p == root:
             return {"error": "Refusing to delete the working root directory"}
         if p.is_dir():
@@ -570,20 +698,20 @@ class ToolExecutor:
 
     def _copy_path(self, src: str, dst: str) -> dict:
         try:
-            s = _validate_path(src, must_exist=True)
-            d = _validate_path(dst)
+            s = _validate_path(src, self.config, must_exist=True)
+            d = _validate_path(dst, self.config)
         except (PermissionError, FileNotFoundError) as e:
             return {"error": str(e)}
         if s.is_dir():
-            shutil.copytree(s, d)
+            shutil.copytree(s, d, dirs_exist_ok=True)
         else:
             shutil.copy2(s, d)
         return {"success": True, "src": str(s), "dst": str(d)}
 
     def _move_path(self, src: str, dst: str) -> dict:
         try:
-            s = _validate_path(src, must_exist=True)
-            d = _validate_path(dst)
+            s = _validate_path(src, self.config, must_exist=True)
+            d = _validate_path(dst, self.config)
         except (PermissionError, FileNotFoundError) as e:
             return {"error": str(e)}
 

@@ -1,4 +1,5 @@
 """Local RAG (Retrieval-Augmented Generation) for MILEX."""
+import asyncio
 import json
 import os
 import re
@@ -21,11 +22,11 @@ class RagManager:
         self.client = ollama.Client(host=config["ollama_host"])
         self.storage_dir = Path.home() / ".milex" / "rag_index"
         self.index_file = self.storage_dir / "index.json"
-        
+
         # In-memory index
         self.chunks: List[Dict] = []  # List of {text, path, start_line}
         self.embeddings: Optional[np.ndarray] = None
-        
+
         self.storage_dir.mkdir(parents=True, exist_ok=True)
         self._load_index()
 
@@ -36,13 +37,36 @@ class RagManager:
                 with open(self.index_file, 'r') as f:
                     data = json.load(f)
                     self.chunks = data.get("chunks", [])
-                    # We don't store embeddings in JSON usually because of size, 
-                    # but for small projects we could. 
+                    # We don't store embeddings in JSON usually because of size,
+                    # but for small projects we could.
                     # For now, we'll re-embed or expect persistence if small.
-                    if "embeddings" in data:
+                    if "embeddings" in data and data["embeddings"]:
                         self.embeddings = np.array(data["embeddings"])
             except Exception as e:
                 print_warning(f"Failed to load RAG index: {e}")
+
+    async def _generate_embeddings_async(self, texts: List[str], model: str) -> List[List[float]]:
+        """Generate embeddings asynchronously using asyncio."""
+        batch_size = self.rag_config.get("batch_size", 32)
+        all_embeddings = []
+
+        for i in range(0, len(texts), batch_size):
+            batch = texts[i:i + batch_size]
+            # Process batch concurrently
+            tasks = [
+                asyncio.to_thread(self.client.embeddings, model=model, prompt=text)
+                for text in batch
+            ]
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+
+            for result in results:
+                if isinstance(result, Exception):
+                    print_warning(f"Embedding error: {result}")
+                    all_embeddings.append([0.0] * 768)  # Fallback
+                else:
+                    all_embeddings.append(result["embedding"])
+
+        return all_embeddings
 
     def _save_index(self):
         """Save the current index to disk."""
@@ -59,30 +83,30 @@ class RagManager:
         exclude_dirs = self.rag_config.get("exclude_dirs", [])
         chunk_size = self.rag_config.get("chunk_size", 1000)
         chunk_overlap = self.rag_config.get("chunk_overlap", 100)
-        
+
         # Respect .gitignore
         ignore_spec = self._get_ignore_spec(root)
-        
+
         new_chunks = []
         files_to_index = []
 
         for p in root.rglob("*"):
             if not p.is_file():
                 continue
-            
+
             # Skip excluded dirs
             if any(part in exclude_dirs for part in p.parts):
                 continue
-            
+
             # Skip matches in gitignore
             rel_p = p.relative_to(root)
             if ignore_spec and ignore_spec.match_file(str(rel_p)):
                 continue
-            
+
             # Only index text-like files
             if p.suffix.lower() not in ('.py', '.js', '.md', '.txt', '.go', '.html', '.css', '.c', '.cpp', '.h', '.sh', '.yml', '.yaml', '.toml', '.json'):
                 continue
-                
+
             files_to_index.append(p)
 
         if not files_to_index:
@@ -101,29 +125,43 @@ class RagManager:
         if not new_chunks:
             return
 
-        # Generate embeddings
+        # Generate embeddings using async method
         model = self.config.get("roles", {}).get("embeddings", "nomic-embed-text:latest")
-        with ThinkingSpinner(f"Generating embeddings using {model}..."):
-            try:
-                # Batch embedding if possible
-                texts = [c["text"] for c in new_chunks]
-                
-                # Ollama client doesn't support batch embed in a single call easily in all versions, 
-                # so we do it in smaller batches or individually.
-                all_embeddings = []
-                batch_size = 32
-                for i in range(0, len(texts), batch_size):
-                    batch = texts[i:i + batch_size]
-                    for text in batch:
-                        resp = self.client.embeddings(model=model, prompt=text)
-                        all_embeddings.append(resp["embedding"])
-                
-                self.chunks = new_chunks
-                self.embeddings = np.array(all_embeddings)
-                self._save_index()
-                print_success(f"Indexed {len(self.chunks)} chunks from {len(files_to_index)} files.")
-            except Exception as e:
-                print_error(f"Embedding failed: {e}")
+
+        # Run async embedding generation in event loop
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                # If we're already in an async context, create a new task
+                import concurrent.futures
+                with concurrent.futures.ThreadPoolExecutor() as executor:
+                    all_embeddings = []
+                    texts = [c["text"] for c in new_chunks]
+                    batch_size = 32
+                    for i in range(0, len(texts), batch_size):
+                        batch = texts[i:i + batch_size]
+                        for text in batch:
+                            resp = self.client.embeddings(model=model, prompt=text)
+                            all_embeddings.append(resp["embedding"])
+            else:
+                all_embeddings = loop.run_until_complete(
+                    self._generate_embeddings_async([c["text"] for c in new_chunks], model)
+                )
+        except RuntimeError:
+            # No event loop, run synchronously
+            all_embeddings = []
+            texts = [c["text"] for c in new_chunks]
+            batch_size = 32
+            for i in range(0, len(texts), batch_size):
+                batch = texts[i:i + batch_size]
+                for text in batch:
+                    resp = self.client.embeddings(model=model, prompt=text)
+                    all_embeddings.append(resp["embedding"])
+
+        self.chunks = new_chunks
+        self.embeddings = np.array(all_embeddings)
+        self._save_index()
+        print_success(f"Indexed {len(self.chunks)} chunks from {len(files_to_index)} files.")
 
     def search(self, query: str, top_k: int = 5) -> List[Dict]:
         """Search for the most relevant chunks for a query."""

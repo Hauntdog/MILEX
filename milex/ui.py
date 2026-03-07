@@ -1,7 +1,7 @@
 """Rich-based UI components for MILEX CLI."""
 import re
 import sys
-from typing import Iterator, Optional
+from typing import Any, Dict, Iterator, Optional
 
 from rich import box
 from rich.align import Align
@@ -123,43 +123,36 @@ class AgentUI:
 
 
 class RichUI(AgentUI):
-    """Rich-based implementation of the Agent UI."""
+    """Rich-based implementation of the Agent UI with simplified delegation."""
 
-    def __init__(self, console_obj=None):
-        self.console = console_obj or console
+    def __init__(self, console_obj: Optional[Console] = None):
+        self.console: Console = console_obj or console
 
-    def print_ai_message(self, text: str, model: str = "MILEX"):
-        print_ai_message(text, model)
-
-    def print_tool_call(self, tool_name: str, args: dict):
-        print_tool_call(tool_name, args)
-
-    def print_tool_result(self, tool_name: str, result: dict, success: bool = True):
-        print_tool_result(tool_name, result, success)
-
-    def print_error(self, message: str):
-        print_error(message)
-
-    def print_success(self, message: str):
-        print_success(message)
-
-    def print_warning(self, message: str):
-        print_warning(message)
-
-    def print_info(self, message: str):
-        print_info(message)
+    def __getattr__(self, name: str):
+        """Delegate to module-level functions for common operations."""
+        # Map method names to module functions
+        func_map = {
+            "print_ai_message": print_ai_message,
+            "print_tool_call": print_tool_call,
+            "print_tool_result": print_tool_result,
+            "print_error": print_error,
+            "print_success": print_success,
+            "print_warning": print_warning,
+            "print_info": print_info,
+            "print_code_block": print_code_block,
+        }
+        if name in func_map:
+            return func_map[name]
+        raise AttributeError(f"'{type(self).__name__}' object has no attribute '{name}'")
 
     def confirm_tool(self, tool_name: str, args: dict) -> bool:
         return confirm_tool_execution(tool_name, args)
 
-    def create_stream_renderer(self, model: str = "MILEX"):
+    def create_stream_renderer(self, model: str = "MILEX") -> StreamRenderer:
         return StreamRenderer(model=model)
 
-    def create_thinking_spinner(self, message: str = "Thinking..."):
+    def create_thinking_spinner(self, message: str = "Thinking...") -> ThinkingSpinner:
         return ThinkingSpinner(message=message)
-
-    def print_code_block(self, code: str, language: str = "python", filename: Optional[str] = None):
-        print_code_block(code, language, filename)
 
     def ask_save_file(self, code: str, language: str) -> Optional[str]:
         self.console.print(
@@ -234,8 +227,26 @@ def print_tool_call(tool_name: str, args: dict):
 
 
 def print_tool_result(tool_name: str, result: dict, success: bool = True):
-    """Display tool execution result."""
+    """Display tool execution result. File operations get a compact summary."""
     import json
+
+    # Compact one-liner for file write/edit/append operations
+    if success and tool_name in ("write_file", "edit_file", "append_file"):
+        path = result.get("path", "?")
+        if tool_name == "write_file":
+            size = result.get("bytes_written", "?")
+            console.print(f"\n[bold green]✍ Wrote[/] [dim]{size} bytes →[/] [cyan]{path}[/]")
+        elif tool_name == "edit_file":
+            applied = result.get("edits_applied", 0)
+            failed = result.get("edits_failed", 0)
+            status = f"{applied} edit{'s' if applied != 1 else ''} applied"
+            if failed:
+                status += f", [red]{failed} failed[/]"
+            console.print(f"\n[bold green]✏ Edited[/] [cyan]{path}[/] [dim]({status})[/]")
+        elif tool_name == "append_file":
+            size = result.get("bytes_appended", "?")
+            console.print(f"\n[bold green]✍ Appended[/] [dim]{size} bytes →[/] [cyan]{path}[/]")
+        return
 
     result_str = json.dumps(result, indent=2)
     style = "green" if success else "red"
