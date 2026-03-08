@@ -18,6 +18,12 @@ from prompt_toolkit.formatted_text import HTML
 from prompt_toolkit.history import FileHistory
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.styles import Style as PTStyle
+
+# Custom prompt_toolkit style
+PT_STYLE = PTStyle.from_dict({
+    "": "ansigreen",
+    "prompt": "ansigreen bold",
+})
 from rich.prompt import Confirm
 
 from .agent import MilexAgent

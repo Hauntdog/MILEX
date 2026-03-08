@@ -1,0 +1,20 @@
+#!/bin/bash
+# Ollama wrapper - uses API instead of interactive mode to avoid ANSI escape issues
+# Works in VSCode terminal, Kali terminal, and any other terminal
+# Usage: ollama-ask [model] "your prompt"
+
+MODEL="${1:-qwen2.5:1.5b}"
+shift
+
+if [ -z "$1" ]; then
+    echo "Usage: ollama-ask <model> <prompt>"
+    echo "Example: ollama-ask qwen2.5:1.5b 'Hello, how are you?'"
+    exit 1
+fi
+
+PROMPT="$*"
+
+# Use Ollama API - returns clean output without ANSI escape codes
+curl -s http://localhost:11434/api/generate \
+    -d "{\"model\": \"$MODEL\", \"prompt\": \"$PROMPT\", \"stream\": false}" \
+    | jq -r '.response'
