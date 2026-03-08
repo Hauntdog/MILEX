@@ -148,10 +148,10 @@ class RichUI(AgentUI):
     def confirm_tool(self, tool_name: str, args: dict) -> bool:
         return confirm_tool_execution(tool_name, args)
 
-    def create_stream_renderer(self, model: str = "MILEX") -> StreamRenderer:
+    def create_stream_renderer(self, model: str = "MILEX") -> "StreamRenderer":
         return StreamRenderer(model=model)
 
-    def create_thinking_spinner(self, message: str = "Thinking...") -> ThinkingSpinner:
+    def create_thinking_spinner(self, message: str = "Thinking...") -> "ThinkingSpinner":
         return ThinkingSpinner(message=message)
 
     def ask_save_file(self, code: str, language: str) -> Optional[str]:
@@ -387,7 +387,7 @@ class ThinkingSpinner:
             self._task = self._progress.add_task(self.message)
         else:
             # Headless mode: just a simple indicator
-            console.print(f"[dim cyan]● {self.message}[/]", end=" ", flush=True)
+            console.print(f"[dim cyan]● {self.message}[/]", end=" ")
         return self
 
     def __exit__(self, *args):

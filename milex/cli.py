@@ -287,6 +287,43 @@ def daemonize(log_path: Path = DAEMON_LOG) -> None:
     os.dup2(log_fd.fileno(), sys.stderr.fileno())
 
 
+# ─── Command Registry ───────────────────────────────────────────────────────────
+
+from dataclasses import dataclass
+from typing import Callable, Awaitable, Optional
+
+
+@dataclass
+class CommandHandler:
+    """Represents a slash command handler."""
+    handler: Callable[["MilexAgent", list], Awaitable[bool]]
+    min_args: int = 0
+    description: str = ""
+
+
+class CommandRegistry:
+    """Registry for slash commands - eliminates large if-elif chains."""
+
+    def __init__(self):
+        self._commands: Dict[str, CommandHandler] = {}
+
+    def register(self, name: str, handler: Callable, min_args: int = 0, description: str = ""):
+        """Register a command handler."""
+        self._commands[name] = CommandHandler(handler, min_args, description)
+
+    def get_handler(self, command: str) -> Optional[CommandHandler]:
+        """Get handler for a command."""
+        return self._commands.get(command)
+
+    def list_commands(self) -> List[str]:
+        """List all registered commands."""
+        return list(self._commands.keys())
+
+
+# Create global registry
+command_registry = CommandRegistry()
+
+
 # ─── Prompt Toolkit Setup ─────────────────────────────────────────────────────
 
 # Commands are now registered via command_registry - generate list from registry
