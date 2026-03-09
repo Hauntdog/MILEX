@@ -5,10 +5,13 @@ import json
 import os
 import re
 import signal
-import socket
 import sys
 from pathlib import Path
 from typing import Optional, Dict, Any, List
+from dotenv import load_dotenv
+
+# Load environment variables from .env if it exists
+load_dotenv()
 
 import typer
 from prompt_toolkit import PromptSession
@@ -124,66 +127,77 @@ class DaemonServer:
     def __init__(self, agent: MilexAgent) -> None:
         self.agent = agent
         self._stop_event = asyncio.Event()
+        self._lock = asyncio.Lock()
+        self.token = agent.config.get("daemon_token")
 
     async def _handle_command(self, writer: asyncio.StreamWriter, msg: dict) -> bool:
-        mtype   = msg.get("type", "chat")
-        content = msg.get("content", "")
+        async with self._lock:
+            mtype   = msg.get("type", "chat")
+            content = msg.get("content", "")
 
-        if mtype == "ping":
-            await _send_msg(writer, {"type": "pong"})
+            if mtype == "ping":
+                await _send_msg(writer, {"type": "pong"})
+                return True
+
+            if mtype == "disconnect":
+                return False
+
+            if mtype in ("chat", "stream_chat"):
+                # Capture output from agent and forward as chunks
+                from .ui import console as ui_console
+                
+                class _WriterProxy:
+                    def write(self_, data): # noqa
+                        if data:
+                            asyncio.create_task(_send_msg(writer, {"type": "chunk", "content": data}))
+                    def flush(self_): pass
+
+                old_file = ui_console.file
+                ui_console.file = _WriterProxy() # type: ignore
+                try:
+                    if mtype == "stream_chat":
+                        await self.agent.stream_chat(content)
+                    else:
+                        await self.agent.chat(content)
+                finally:
+                    ui_console.file = old_file
+                await _send_msg(writer, {"type": "done"})
+                return True
+
+            if mtype == "slash":
+                import io
+                from .ui import console as ui_console
+                buf = io.StringIO()
+                old_file = ui_console.file
+                ui_console.file = buf # type: ignore
+                try:
+                    keep = await handle_slash_command(content, self.agent)
+                finally:
+                    ui_console.file = old_file
+                await _send_msg(writer, {"type": "slash_result", "content": buf.getvalue(), "keep": keep})
+                return True
+
+            if mtype == "config_get":
+                await _send_msg(writer, {"type": "config", "content": self.agent.config})
+                return True
+
+            if mtype == "stop_server":
+                await _send_msg(writer, {"type": "bye"})
+                self._stop_event.set()
+                return False
+
             return True
-
-        if mtype == "disconnect":
-            return False
-
-        if mtype in ("chat", "stream_chat"):
-            # Capture output from agent and forward as chunks
-            from .ui import console as ui_console
-            
-            class _WriterProxy:
-                def write(self_, data): # noqa
-                    if data:
-                        asyncio.create_task(_send_msg(writer, {"type": "chunk", "content": data}))
-                def flush(self_): pass
-
-            old_file = ui_console.file
-            ui_console.file = _WriterProxy() # type: ignore
-            try:
-                if mtype == "stream_chat":
-                    await self.agent.stream_chat(content)
-                else:
-                    await self.agent.chat(content)
-            finally:
-                ui_console.file = old_file
-            await _send_msg(writer, {"type": "done"})
-            return True
-
-        if mtype == "slash":
-            import io
-            from .ui import console as ui_console
-            buf = io.StringIO()
-            old_file = ui_console.file
-            ui_console.file = buf # type: ignore
-            try:
-                keep = await handle_slash_command(content, self.agent)
-            finally:
-                ui_console.file = old_file
-            await _send_msg(writer, {"type": "slash_result", "content": buf.getvalue(), "keep": keep})
-            return True
-
-        if mtype == "config_get":
-            await _send_msg(writer, {"type": "config", "content": self.agent.config})
-            return True
-
-        if mtype == "stop_server":
-            await _send_msg(writer, {"type": "bye"})
-            self._stop_event.set()
-            return False
-
-        return True
 
     async def _client_connected(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
         try:
+            # Step 1: Authentication Handshake
+            if self.token:
+                msg = await _recv_msg(reader)
+                if not msg or msg.get("type") != "auth" or msg.get("token") != self.token:
+                    await _send_msg(writer, {"type": "error", "content": "Authentication failed"})
+                    return
+                await _send_msg(writer, {"type": "auth_ok"})
+
             while not self._stop_event.is_set():
                 msg = await _recv_msg(reader)
                 if msg is None: break
@@ -205,6 +219,18 @@ class DaemonServer:
         atexit.register(lambda: PID_FILE.unlink(missing_ok=True))
         atexit.register(lambda: SOCK_FILE.unlink(missing_ok=True))
 
+        # Handle signals for graceful shutdown
+        def _on_signal():
+            self._stop_event.set()
+        
+        loop = asyncio.get_running_loop()
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            try:
+                loop.add_signal_handler(sig, _on_signal)
+            except NotImplementedError:
+                # Signal handlers not supported on Windows (not used here but for robustness)
+                pass
+
         async with server:
             # Task to keep agent warm
             self.agent.start_background_tasks()
@@ -219,9 +245,18 @@ class DaemonClient:
         self._reader: Optional[asyncio.StreamReader] = None
         self._writer: Optional[asyncio.StreamWriter] = None
 
-    async def connect(self) -> bool:
+    async def connect(self, config: dict) -> bool:
         try:
             self._reader, self._writer = await asyncio.open_unix_connection(str(SOCK_FILE))
+            
+            # Authentication Handshake
+            token = config.get("daemon_token")
+            if token:
+                await _send_msg(self._writer, {"type": "auth", "token": token})
+                resp = await _recv_msg(self._reader)
+                if not resp or resp.get("type") != "auth_ok":
+                    return False
+            
             return True
         except (FileNotFoundError, ConnectionRefusedError, OSError):
             return False
@@ -564,8 +599,34 @@ async def _cmd_sandbox(cmd: str, agent: MilexAgent) -> bool:
                 agent.config["allowed_root"] = str(p)
             else:
                 print_error(f"Path invalid: {p}")
-        save_config(agent.config)
-        print_success(f"Sandbox set: {agent.config['allowed_root']}")
+    return True
+
+
+async def _cmd_telemetry(cmd: str, agent: MilexAgent) -> bool:
+    """Handle /telemetry command."""
+    from .telemetry import telemetry
+    from rich.table import Table
+    stats = telemetry.get_stats()
+    if not stats:
+        print_info("No telemetry data yet.")
+        return True
+    
+    table = Table(title="Tool Telemetry")
+    table.add_column("Tool")
+    table.add_column("Hits", justify="right")
+    table.add_column("Errors", justify="right", style="red")
+    table.add_column("Avg Latency", justify="right", style="cyan")
+    table.add_column("Max Latency", justify="right", style="magenta")
+    
+    for name, s in stats.items():
+        table.add_row(
+            name,
+            str(s["count"]),
+            str(s["errors"]),
+            f"{s['avg_ms']}ms",
+            f"{s['max_ms']}ms"
+        )
+    console.print(table)
     return True
 
 
@@ -585,6 +646,7 @@ command_registry.register("/code", _cmd_code, 2, "Generate code for a task")
 command_registry.register("/run", _cmd_run, 1, "Run a shell command")
 command_registry.register("/sysinfo", _cmd_sysinfo, 0, "Show system information")
 command_registry.register("/sandbox", _cmd_sandbox, 0, "Set sandbox root directory")
+command_registry.register("/telemetry", _cmd_telemetry, 0, "Show tool performance stats")
 
 
 async def handle_slash_command(cmd: str, agent: MilexAgent) -> bool:
@@ -623,7 +685,7 @@ async def run_interactive_daemon(client: DaemonClient, cfg: dict):
         try:
             if session:
                 user_input = await session.prompt_async(
-                    HTML("\n<ansigreen>❯</ansigreen> <ansicyan>You</ansicyan> › "),
+                    HTML("\n<prompt>❯</prompt> <ansicyan>You</ansicyan> › "),
                     bottom_toolbar=lambda: HTML(get_toolbar_text(cfg)),
                 )
             else:
@@ -669,7 +731,7 @@ async def run_interactive(agent: MilexAgent):
         try:
             if session:
                 user_input = await session.prompt_async(
-                    HTML("\n<ansigreen>❯</ansigreen> <ansicyan>You</ansicyan> › "),
+                    HTML("\n<prompt>❯</prompt> <ansicyan>You</ansicyan> › "),
                     bottom_toolbar=lambda: HTML(get_toolbar_text(agent.config)),
                 )
             else:
@@ -740,7 +802,7 @@ async def _async_main(prompt, model, auto, background, no_daemon):
     # Try connection
     if not no_daemon and _daemon_running():
         client = DaemonClient()
-        if await client.connect() and await client.ping():
+        if await client.connect(cfg) and await client.ping():
             if prompt:
                 print_user_message(prompt)
                 await client.stream_chat(prompt)
@@ -785,8 +847,9 @@ def start_daemon_cmd(
 def stop_daemon_cmd():
     """Stop the background MILEX daemon."""
     async def _do_stop():
+        cfg = load_config()
         client = DaemonClient()
-        if await client.connect():
+        if await client.connect(cfg):
             if client._writer:
                 await _send_msg(client._writer, {"type": "stop_server"})
                 print_success("Sent stop command to daemon.")
@@ -868,6 +931,34 @@ def set_config_cmd(
     cfg[key] = typed
     save_config(cfg)
     print_success(f"Config updated: [cyan]{key}[/] = [white]{typed}[/]")
+
+
+@app.command(name="mcp-server")
+def mcp_server_cmd():
+    """Run MILEX as an MCP Server (stdio)."""
+    from .mcp_server import main as mcp_main
+    asyncio.run(mcp_main())
+
+
+@app.command(name="telemetry")
+def telemetry_cmd():
+    """Show tool performance stats."""
+    from .telemetry import telemetry
+    from rich.table import Table
+    stats = telemetry.get_stats()
+    if not stats:
+        print_info("No telemetry data yet.")
+        return
+    
+    table = Table(title="Tool Telemetry")
+    table.add_column("Tool")
+    table.add_column("Hits", justify="right")
+    table.add_column("Errors", justify="right", style="red")
+    table.add_column("Avg Latency", justify="right", style="cyan")
+    
+    for name, s in stats.items():
+        table.add_row(name, str(s["count"]), str(s["errors"]), f"{s['avg_ms']}ms")
+    console.print(table)
 
 
 if __name__ == "__main__":

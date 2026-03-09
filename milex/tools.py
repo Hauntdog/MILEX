@@ -17,9 +17,6 @@ MAX_READ_BYTES = 1 * 1024 * 1024  # 1 MB
 # Set of dangerous tool names that require confirmation
 DANGEROUS_TOOLS = frozenset({
     "run_shell",
-    "delete_path",
-    "copy_path",
-    "move_path",
 })
 
 
@@ -372,6 +369,38 @@ TOOL_DEFINITIONS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "read_url_content",
+            "description": "Fetch content from a URL and return its text/markdown content. Useful for research.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "url": {"type": "string", "description": "URL to read from"}
+                },
+                "required": ["url"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "read_files",
+            "description": "Read multiple files at once. Efficient for understanding dependencies and architecting.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "paths": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "List of absolute or relative file paths to read",
+                    }
+                },
+                "required": ["paths"],
+            },
+        },
+    },
 ]
 
 
@@ -424,8 +453,51 @@ class ToolExecutor:
                 if self.ui: self.ui.print_warning(f"Plugin load error ({py_file.name}): {e}")
 
     async def execute_async(self, tool_name: str, args: Dict[str, Any]) -> Dict[str, Any]:
-        """Wrap execute in a thread to keep main loop free."""
-        return await asyncio.to_thread(self.execute, tool_name, args)
+        """Execute a tool. Handles both internal and MCP tools with telemetry."""
+        from .telemetry import telemetry
+        import time
+        start_time = time.time()
+        success = True
+        error = None
+        
+        try:
+            # Handle MCP Tools (prefixed with server_name__)
+            if "__" in tool_name and self.agent and hasattr(self.agent, "mcp"):
+                parts = tool_name.split("__", 1)
+                server_name, raw_tool_name = parts[0], parts[1]
+                
+                # MCP calls are always async
+                try:
+                    mcp_res = await self.agent.mcp.call_tool(server_name, raw_tool_name, args)
+                    # Convert MCP result to dict format
+                    result = {"content": [str(c) for c in mcp_res.content], "isError": mcp_res.isError}
+                    if mcp_res.isError: success = False
+                    return result
+                except Exception as e:
+                    error = str(e)
+                    success = False
+                    return {"error": f"MCP Error: {error}"}
+
+            # Internal tools are executed in a thread to keep the event loop free
+            result = await asyncio.to_thread(self.execute, tool_name, args)
+            if "error" in result: 
+                success = False
+                error = result["error"]
+            return result
+        finally:
+            # Record execution telemetry
+            telemetry.record(tool_name, time.time() - start_time, success, error)
+
+    async def get_all_tools(self) -> List[Dict[str, Any]]:
+        """Fetch all available tools (internal + plugins + MCP)."""
+        tools = TOOL_DEFINITIONS.copy()
+        
+        # Add MCP tools if agent and MCP are available
+        if self.agent and hasattr(self.agent, "mcp"):
+            mcp_tools = await self.agent.mcp.get_all_tools()
+            tools.extend(mcp_tools)
+            
+        return tools
 
     def execute(self, tool_name: str, args: Dict[str, Any]) -> Dict[str, Any]:
         """Dispatch to the appropriate tool handler."""
@@ -447,6 +519,8 @@ class ToolExecutor:
             "generate_code": self._generate_code,
             "rag_index": self._rag_index,
             "rag_search": self._rag_search,
+            "read_url_content": self._read_url_content,
+            "read_files": self._read_files,
         }
 
         # Merge with plugins
@@ -758,3 +832,41 @@ class ToolExecutor:
             return {"error": "RAG is disabled"}
         results = self.rag.search(query, top_k=count)
         return {"results": results, "count": len(results)}
+
+    def _read_url_content(self, url: str) -> dict:
+        try:
+            import requests
+            from bs4 import BeautifulSoup
+            from markdownify import markdownify as md
+
+            headers = {"User-Agent": "Mozilla/5.0 (MILEX Bot)"}
+            resp = requests.get(url, headers=headers, timeout=15)
+            resp.raise_for_status()
+            
+            soup = BeautifulSoup(resp.text, "html.parser")
+            
+            # Remove script and style elements
+            for script in soup(["script", "style"]):
+                script.decompose()
+
+            # Basic markdown conversion
+            markdown = md(str(soup), heading_style="ATX", bullets="-")
+            
+            # Clean up whitespace
+            markdown = "\n".join(line for line in markdown.splitlines() if line.strip())
+            
+            return {
+                "url": url,
+                "title": soup.title.string if soup.title else "No Title",
+                "content": markdown[:50000],  # Limit to 50k chars
+                "truncated": len(markdown) > 50000
+            }
+        except Exception as e:
+            return {"error": f"Failed to read URL: {str(e)}"}
+
+    def _read_files(self, paths: List[str]) -> dict:
+        results = {}
+        for path in paths:
+            res = self._read_file(path)
+            results[path] = res
+        return {"files": results}

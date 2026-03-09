@@ -15,11 +15,11 @@ DEFAULT_CONFIG = {
     "roles": {
         "primary": "qwen2.5:1.5b",
         "coder": "qwen2.5:1.5b", # Use faster model by default for code tasks
-        "planner": "qwen2.5:1.5b",
         "embeddings": "nomic-embed-text:latest",
         "fallback": "qwen2.5:1.5b"
     },
     "ollama_host": "http://localhost:11434",
+    "daemon_token": None,  # Will be generated in load_config
     "theme": "dark",
     "max_tokens": 2048,
     "num_ctx": 2048,        # Optimized for CPU "Air" performance
@@ -37,40 +37,40 @@ DEFAULT_CONFIG = {
     "repeat_penalty": 1.1,  # Prevent repetitive outputs
     "allowed_root": None,
     "plugin_dir": str(CONFIG_DIR / "plugins"),
+    "mcp_servers": {
+        # Example format: 
+        # "github": {"command": "npx", "args": ["-y", "@modelcontextprotocol/server-github"]}
+    },
     "rag": {
         "enabled": True,
         "index_on_startup": False,
         "chunk_size": 1000,
         "chunk_overlap": 100,
+        "similarity_threshold": 0.3, # Cosine similarity threshold for RAG results
         "exclude_dirs": [".git", "__pycache__", ".venv", "node_modules", "dist", "build"]
     },
     "system_prompt": (
-        "You are MILEX, an elite AI coding assistant and computer-control agent.\n\n"
+        "You are MILEX, an elite AI Agentic Coder and Computer-Control Agent, designed to build and architect complex systems.\n\n"
         "CORE CAPABILITIES:\n"
-        "- Generate complete, production-ready code in ANY programming language.\n"
-        "- Execute shell commands and manage system processes.\n"
-        "- Full filesystem access: read, write, edit, append, move, rename, and manage files/directories.\n"
-        "- Semantic Search (RAG): Index your projects and search for relevant code/docs semanticially using 'rag_index' and 'rag_search'.\n"
-        "- Desktop automation: open web browser, manage clipboard, etc.\n\n"
+        "- ARCHITECTING: You don't just write code; you design systems. Use 'read_files', 'list_directory', and 'rag_search' to understand the whole codebase before making changes.\n"
+        "- BROWSER & RESEARCH: Use 'read_url_content' to read documentation, latest library versions, or research solutions on the web.\n"
+        "- AUTONOMOUS FILE SAVING: Use 'write_file' or 'edit_file' to save all changes directly to disk. Never just display code in chat without saving.\n"
+        "- MULTI-FILE EDITS: Use 'edit_file' for targeted find-and-replace across existing files. Use 'write_file' for new files.\n"
+        "- COMPUTER CONTROL: Execute shell commands via 'run_shell' to build, test, and manage the environment.\n\n"
+        "ARCHITECTURAL WORKFLOW (CRITICAL):\n"
+        "1. ANALYSIS: When given a complex task, start by exploring the codebase. Read relevant files and dependencies.\n"
+        "2. PLANNING: For any multi-step task, create an 'implementation_plan.md' file first. Outline the steps, files to be modified, and potential risks.\n"
+        "3. EXECUTION: Follow your plan. You have full authority to manage files (create, edit, delete, move) autonomously without asking for permission for individual steps.\n"
+        "4. VERIFICATION: After coding, run tests or linting via 'run_shell' if applicable to ensure correctness.\n\n"
         "OPERATIONAL RULES:\n"
-        "1. ALWAYS return COMPLETE code — never use placeholders or trancations (e.g., no '// ...').\n"
-        "2. Use appropriate markdown code blocks for all code and terminal output.\n"
-        "3. Follow best practices for the language being used (idiomatic, clean, documented).\n"
-        "4. Use tool calls for all system-level operations. Do not just describe them.\n"
-        "5. Be concise and technical. Avoid conversational filler.\n"
-        "6. If a task is complex, break it down into steps and execute them sequentially.\n"
-        "7. ALWAYS confirm before performing potentially destructive operations (delete, overwrite) unless auto-execute is enabled.\n\n"
-        "FILE SAVING BEHAVIOR (CRITICAL):\n"
-        "- When the user asks you to create, modify, or generate code, ALWAYS save the result to disk using the 'write_file' or 'edit_file' tool.\n"
-        "- Do NOT just display code in chat and wait for the user to save it manually.\n"
-        "- For NEW files: use 'write_file' to create them directly.\n"
-        "- For EXISTING files: prefer 'edit_file' for targeted changes or 'write_file' to replace the whole file.\n"
-        "- If a filename is not specified, infer a reasonable filename from context (e.g., 'main.py', 'server.js', 'style.css').\n"
-        "- After saving, briefly confirm what was written and where.\n"
+        "- ALWAYS return COMPLETE, production-ready code. No placeholders, no '// ...' truncations.\n"
+        "- Be technical, concise, and proactive. Do not wait for permission for safe tool calls (like reading files or URLs).\n"
+        "- If the user hasn't specified a filename, infer one idiomatic to the project (e.g., 'utils.py', 'main.js').\n"
+        "- Support high-end aesthetics: Use Rich-style formatting in your responses.\n"
     ),
     "compact_system_prompt": (
-        "You are MILEX, an AI agent. Execute tasks using tools. Be brief. Complete code only. "
-        "ALWAYS save files directly using write_file or edit_file — never just show code in chat."
+        "You are MILEX, an elite Agentic Coder. Plan via 'implementation_plan.md', research via 'read_url_content', "
+        "and architect via 'read_files'. Always save changes directly to disk using tools."
     ),
 }
 
@@ -126,23 +126,22 @@ def ensure_config_dir():
 
 def load_config() -> dict:
     ensure_config_dir()
+    cfg = DEFAULT_CONFIG.copy()
     if CONFIG_FILE.exists():
         try:
             with open(CONFIG_FILE) as f:
-                cfg = json.load(f)
-            # merge with defaults for any missing keys
-            return {**DEFAULT_CONFIG, **cfg}
-        except json.JSONDecodeError as exc:
-            print(
-                f"[milex] Warning: config file is corrupt ({exc}). Using defaults.",
-                file=sys.stderr,
-            )
-        except OSError as exc:
-            print(
-                f"[milex] Warning: could not read config ({exc}). Using defaults.",
-                file=sys.stderr,
-            )
-    return DEFAULT_CONFIG.copy()
+                user_cfg = json.load(f)
+            cfg.update(user_cfg)
+        except (json.JSONDecodeError, OSError) as exc:
+            print(f"[milex] Warning: config issue ({exc}). Using defaults.", file=sys.stderr)
+
+    # Ensure we have a daemon token for security
+    if not cfg.get("daemon_token"):
+        import secrets
+        cfg["daemon_token"] = secrets.token_hex(16)
+        save_config(cfg)
+        
+    return cfg
 
 
 def save_config(config: dict):

@@ -1,20 +1,16 @@
 """Rich-based UI components for MILEX CLI."""
-import re
 import sys
-from typing import Any, Dict, Iterator, Optional
+from typing import Optional
 
 from rich import box
 from rich.align import Align
-from rich.columns import Columns
 from rich.console import Console
-from rich.layout import Layout
 from rich.live import Live
 from rich.markdown import Markdown
 from rich.panel import Panel
 from rich.progress import Progress, SpinnerColumn, TextColumn
 from rich.prompt import Confirm, Prompt
 from rich.rule import Rule
-from rich.style import Style
 from rich.syntax import Syntax
 from rich.table import Table
 from rich.text import Text

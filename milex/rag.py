@@ -13,6 +13,14 @@ from pathspec.patterns import GitWildMatchPattern
 
 from .ui import console, print_info, print_success, print_warning, ThinkingSpinner
 
+# Try to import tree-sitter for advanced context
+try:
+    import tree_sitter_languages
+    from tree_sitter import Parser
+    TREE_SITTER_AVAILABLE = True
+except ImportError:
+    TREE_SITTER_AVAILABLE = False
+
 class RagManager:
     """Handles file indexing, chunking, and vector search using Ollama embeddings."""
 
@@ -185,8 +193,9 @@ class RagManager:
             top_indices = np.argsort(similarities)[-top_k:][::-1]
             
             results = []
+            threshold = self.config.get("rag", {}).get("similarity_threshold", 0.3)
             for idx in top_indices:
-                if similarities[idx] > 0.3: # Threshold
+                if similarities[idx] > threshold: # Threshold
                     chunk = self.chunks[idx].copy()
                     chunk["score"] = float(similarities[idx])
                     results.append(chunk)
@@ -195,12 +204,34 @@ class RagManager:
             print_error(f"Search failed: {e}")
             return []
 
-    def _chunk_text(self, text: str, path: str, size: int, overlap: int) -> List[Dict]:
-        """Split text into overlapping chunks."""
+    def _chunk_text(self, text: str, path_str: str, size: int, overlap: int) -> List[Dict]:
+        """Split text into overlapping chunks, using tree-sitter if available."""
+        path = Path(path_str)
+        ext = path.suffix.lower().lstrip(".")
+        
+        # Mapping extension to tree-sitter language names
+        lang_map = {
+            "py": "python",
+            "js": "javascript",
+            "ts": "typescript",
+            "go": "go",
+            "rb": "ruby",
+            "java": "java",
+            "cpp": "cpp",
+            "c": "c",
+            "rs": "rust"
+        }
+
+        if TREE_SITTER_AVAILABLE and ext in lang_map:
+            try:
+                return self._tree_sitter_chunk(text, path_str, lang_map[ext])
+            except Exception as e:
+                # Fallback to simple chunking if it fails
+                pass
+
+        # Simple line-based chunking for code to preserve context
         chunks = []
         lines = text.splitlines()
-        
-        # Simple line-based chunking for code to preserve context
         current_chunk = []
         current_size = 0
         start_line = 1
@@ -212,7 +243,7 @@ class RagManager:
             if current_size >= size:
                 chunks.append({
                     "text": "\n".join(current_chunk),
-                    "path": path,
+                    "path": path_str,
                     "start_line": start_line
                 })
                 # Overlap: keep last few lines
@@ -224,9 +255,56 @@ class RagManager:
         if current_chunk:
             chunks.append({
                 "text": "\n".join(current_chunk),
-                "path": path,
+                "path": path_str,
                 "start_line": start_line
             })
+        return chunks
+
+    def _tree_sitter_chunk(self, text: str, path: str, lang_name: str) -> List[Dict]:
+        """Use tree-sitter to chunk by function/class/method."""
+        language = tree_sitter_languages.get_language(lang_name)
+        parser = Parser()
+        parser.set_language(language)
+        
+        tree = parser.parse(bytes(text, "utf8"))
+        
+        # Simple extraction of top-level blocks
+        chunks = []
+        query_str = """
+            (function_definition) @func
+            (class_definition) @class
+            (module) @mod
+            (method_definition) @meth
+        """
+        if lang_name == "javascript" or lang_name == "typescript":
+            query_str = "(function_declaration) @func (class_declaration) @class"
+            
+        try:
+            query = language.query(query_str)
+            captures = query.captures(tree.root_node)
+            
+            for node, tag in captures:
+                # Only take nodes with significant size but not the whole file if multiple
+                if node.end_byte - node.start_byte < 50: continue
+                
+                chunk_text = text[node.start_byte:node.end_byte]
+                chunks.append({
+                    "text": chunk_text,
+                    "path": path,
+                    "start_line": node.start_point[0] + 1,
+                    "type": tag
+                })
+        except Exception:
+            # If query fails, just chunk by top-level nodes
+            for child in tree.root_node.children:
+                if child.end_byte - child.start_byte > 100:
+                    chunks.append({
+                        "text": text[child.start_byte:child.end_byte],
+                        "path": path,
+                        "start_line": child.start_point[0] + 1
+                    })
+        
+        # If no semantic chunks found, return empty to trigger fallback
         return chunks
 
     def _get_ignore_spec(self, root: Path) -> Optional[PathSpec]:

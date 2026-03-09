@@ -12,6 +12,7 @@ import ollama
 from .config import load_config, save_config
 from .tools import TOOL_DEFINITIONS, ToolExecutor
 from .rag import RagManager
+from .mcp_client import MCPClientManager
 from .ui import (
     AgentUI,
     RichUI,
@@ -63,6 +64,9 @@ class MilexAgent:
             RagManager(self.config) if self.config.get("rag", {}).get("enabled", True) else None
         )
 
+        # MCP Manager
+        self.mcp = MCPClientManager(self.config)
+
         self.executor = ToolExecutor(
             config=self.config,
             ui=self.ui,
@@ -87,6 +91,10 @@ class MilexAgent:
         """Must be called within an event loop."""
         if not self._keepalive_task:
             self._keepalive_task = asyncio.create_task(self._keep_model_warm_loop())
+            # Start model validation in background
+            asyncio.create_task(self._validate_model())
+            # Connect to MCP servers
+            asyncio.create_task(self.mcp.connect_all())
 
     async def shutdown(self):
         """Cleanup."""
@@ -253,7 +261,7 @@ class MilexAgent:
                 stream = await self._chat_safe(
                     model=model,
                     messages=messages,
-                    tools=TOOL_DEFINITIONS,
+                    tools=await self.executor.get_all_tools(),
                     stream=True,
                     keep_alive="10m",
                     options=self._get_options(),
@@ -398,7 +406,10 @@ class MilexAgent:
         try:
             with self.ui.create_thinking_spinner():
                 response = await self._chat_safe(
-                    model=model, messages=messages, tools=TOOL_DEFINITIONS, options=self._get_options()
+                    model=model, 
+                    messages=messages, 
+                    tools=await self.executor.get_all_tools(), 
+                    options=self._get_options()
                 )
         except Exception as e:
             self.ui.print_error(f"Execution error: {e}")
