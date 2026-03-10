@@ -20,11 +20,14 @@ MILEX is a powerful command-line interface that leverages **Ollama local models*
 - 🤖 **Local AI** — Uses Ollama models (llama3.2, codellama, mistral, etc.)
 - 💻 **Computer Control** — Execute shell commands, manage files, open URLs
 - 🧑‍💻 **Code Generation** — Generate complete, production-ready code in any language
+- 🔍 **Web Search** — Search docs and code examples before writing code
+- 🌐 **Web Browsing** — Enhanced browsing with JavaScript rendering and form interaction
 - 🎨 **Beautiful UI** — Rich-based interface with syntax highlighting, panels, streaming
 - 🔒 **Safe by Default** — Confirmation prompts before dangerous actions
 - ⚡ **Streaming** — Real-time streaming output
 - 📝 **Persistent History** — Conversation and prompt history
 - ⚙️ **Configurable** — Easy model switching and settings
+- 🔌 **Plugins** — Extend functionality with custom plugins
 
 ---
 
@@ -111,6 +114,17 @@ milex --auto
 | `clipboard_copy` | Copy text to clipboard |
 | `get_system_info` | Get system information |
 | `generate_code` | Generate complete code |
+| `search_docs` | Search the web for documentation and code examples |
+| `browser_navigate` | Enhanced web browsing with JavaScript rendering |
+
+---
+
+## Plugins
+
+MILEX supports plugins located in `~/.milex/plugins/`:
+
+- **web_search** - Search the web for documentation and code examples  
+- **browser** - Enhanced web browsing with form extraction
 
 ---
 
