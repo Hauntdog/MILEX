@@ -1,3 +1,4 @@
+from __future__ import annotations
 import asyncio
 import importlib.util
 import os
@@ -8,7 +9,15 @@ import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple, Callable
+from typing import Any, Dict, List, Optional, Tuple, Callable, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from milex.ui import AgentUI, ThinkingSpinner
+    from milex.rag import RagManager
+    from milex.agent import MilexAgent
+else:
+    # Runtime imports for functionality (not needed for type checking only)
+    from milex.ui import ThinkingSpinner, print_warning
 
 # ─── Module-level security constants & helpers ───────────────────────────────
 
@@ -413,9 +422,9 @@ class ToolExecutor:
     def __init__(
         self,
         config: dict,
-        ui: Optional["AgentUI"] = None,
-        rag: Optional["RagManager"] = None,
-        agent: Optional["MilexAgent"] = None,
+        ui: Optional[AgentUI] = None,
+        rag: Optional[RagManager] = None,
+        agent: Optional[MilexAgent] = None,
         auto_execute: bool = False,
     ):
         self.config = config
@@ -450,7 +459,7 @@ class ToolExecutor:
                     # Register handler
                     self.plugins[module.TOOL_DEFINITION["function"]["name"]] = module.handler
             except Exception as e:
-                if self.ui: self.ui.print_warning(f"Plugin load error ({py_file.name}): {e}")
+                print_warning(f"Plugin load error ({py_file.name}): {e}")
 
     async def execute_async(self, tool_name: str, args: Dict[str, Any]) -> Dict[str, Any]:
         """Execute a tool. Handles both internal and MCP tools with telemetry."""
@@ -700,18 +709,19 @@ class ToolExecutor:
             return {"error": str(e)}
 
         matches = []
-        for f in root.rglob("*"):
-            if not f.is_file():
-                continue
-            if fnmatch.fnmatch(f.name, pattern):
-                if content_search:
-                    try:
-                        if content_search in f.read_text(errors="replace"):
-                            matches.append(str(f))
-                    except Exception:
-                        pass
-                else:
-                    matches.append(str(f))
+        with ThinkingSpinner(f"Searching for '{pattern}'..."):
+            for f in root.rglob("*"):
+                if not f.is_file():
+                    continue
+                if fnmatch.fnmatch(f.name, pattern):
+                    if content_search:
+                        try:
+                            if content_search in f.read_text(errors="replace"):
+                                matches.append(str(f))
+                        except Exception:
+                            pass
+                    else:
+                        matches.append(str(f))
         return {"matches": matches, "count": len(matches)}
 
     def _get_system_info(self) -> dict:
@@ -830,7 +840,8 @@ class ToolExecutor:
     def _rag_search(self, query: str, count: int = 5) -> dict:
         if not self.rag:
             return {"error": "RAG is disabled"}
-        results = self.rag.search(query, top_k=count)
+        with ThinkingSpinner(f"Searching knowledge base for '{query}'..."):
+            results = self.rag.search(query, top_k=count)
         return {"results": results, "count": len(results)}
 
     def _read_url_content(self, url: str) -> dict:
