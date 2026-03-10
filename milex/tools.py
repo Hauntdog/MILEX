@@ -459,7 +459,7 @@ class ToolExecutor:
                     # Register handler
                     self.plugins[module.TOOL_DEFINITION["function"]["name"]] = module.handler
             except Exception as e:
-                print_warning(f"Plugin load error ({py_file.name}): {e}")
+                print(f"Plugin load error ({py_file.name}): {e}")
 
     async def execute_async(self, tool_name: str, args: Dict[str, Any]) -> Dict[str, Any]:
         """Execute a tool. Handles both internal and MCP tools with telemetry."""
