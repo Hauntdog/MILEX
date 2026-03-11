@@ -47,6 +47,81 @@ class Message:
     tool_calls: Optional[List[ToolCall]] = None
 
 
+def _generate_filename_from_code(code: str, language: str) -> str:
+    """Generate a sensible filename from code content.
+    
+    Analyzes the code to find meaningful names (functions, classes, shebangs)
+    and creates an appropriate filename.
+    """
+    # Language to extension mapping
+    ext_map = {
+        "python": ".py",
+        "bash": ".sh",
+        "sh": ".sh",
+        "shell": ".sh",
+        "javascript": ".js",
+        "js": ".js",
+        "typescript": ".ts",
+        "ts": ".ts",
+        "rust": ".rs",
+        "go": ".go",
+        "java": ".java",
+        "c": ".c",
+        "cpp": ".cpp",
+        "c++": ".cpp",
+        "ruby": ".rb",
+        "php": ".php",
+        "html": ".html",
+        "css": ".css",
+        "json": ".json",
+        "yaml": ".yaml",
+        "yml": ".yml",
+        "sql": ".sql",
+        "markdown": ".md",
+        "md": ".md",
+    }
+    
+    ext = ext_map.get(language.lower(), ".txt")
+    
+    # For shell scripts, check shebang
+    if language.lower() in ("bash", "sh", "shell"):
+        shebang_match = re.search(r"^#!.*/(bash|sh|zsh|fish)", code, re.MULTILINE)
+        if shebang_match:
+            return f"script{ext}"
+    
+    # Try to find function or class name
+    # Match function definitions: def function_name, func function_name, fn function_name
+    func_match = re.search(r"^\s*(?:def|func|fn)\s+([a-zA-Z_][a-zA-Z0-9_]*)", code, re.MULTILINE)
+    if func_match:
+        name = func_match.group(1)
+        # Filter out common non-meaningful names
+        if name not in ("main", "init", "__init__", "start", "run", "test"):
+            return f"{name}{ext}"
+    
+    # Match class definitions
+    class_match = re.search(r"^\s*class\s+([A-Z][a-zA-Z0-9_]*)", code, re.MULTILINE)
+    if class_match:
+        return f"{class_match.group(1).lower()}{ext}"
+    
+    # Match main function as fallback
+    if re.search(r"^\s*(?:def|func|fn)\s+main\s*\(", code, re.MULTILINE):
+        return f"main{ext}"
+    
+    # Look for common script patterns
+    if language.lower() in ("bash", "sh", "shell"):
+        # Check for specific purpose in comments
+        comment_match = re.search(r"^\s*#.*(?:backup|deploy|install|setup|deploy|test|cleanup|deploy)\s+.*$", code, re.MULTILINE | re.IGNORECASE)
+        if comment_match:
+            purpose = comment_match.group(0).split()[-1].strip().lower()
+            return f"{purpose}{ext}"
+    
+    # Default filename based on language
+    if language.lower() in ("python", "bash", "sh", "shell", "javascript", "typescript"):
+        return f"script{ext}"
+    
+    return f"generated{ext}"
+
+
 class MilexAgent:
     """Main AI agent that interacts with Ollama via Async API and executes tools."""
 
@@ -159,10 +234,30 @@ class MilexAgent:
         self._roles_dirty = True
 
     async def _chat_safe(self, model: str, **kwargs):
-        """Async chat with fallback retry."""
+        """Async chat with fallback retry and 400 error handling."""
         try:
             return await self._client.chat(model=model, **kwargs)
         except Exception as e:
+            error_msg = str(e).lower()
+            # Handle 400 Bad Request - retry with minimal options
+            if "400" in error_msg or "bad request" in error_msg:
+                self.ui.print_warning(f"Request failed (400), retrying with minimal options...")
+                # Remove potentially problematic options
+                minimal_options = {
+                    "temperature": 0.7,
+                    "num_predict": 2048,
+                }
+                clean_kwargs = kwargs.copy()
+                if "options" in clean_kwargs:
+                    # Merge minimal options with any existing
+                    clean_kwargs["options"] = {**clean_kwargs.get("options", {}), **minimal_options}
+                else:
+                    clean_kwargs["options"] = minimal_options
+                try:
+                    return await self._client.chat(model=model, **clean_kwargs)
+                except Exception as retry_error:
+                    self.ui.print_error(f"Retry also failed: {retry_error}")
+            
             fallback = self._get_model_for_role("fallback")
             if fallback and fallback != model:
                 self.ui.print_warning(f"Retrying with fallback '{fallback}'...")
@@ -178,15 +273,28 @@ class MilexAgent:
         }
         try:
             temp = override_temp if override_temp is not None else self.config.get("temperature", 0.7)
-            return {
+            options = {
                 "temperature": float(temp),
                 "num_predict": int(self.config.get("max_tokens", 2048)),
                 "num_ctx": int(self.config.get("num_ctx", 4096)),
-                "num_thread": int(self.config.get("num_thread", 0)),
-                "num_batch": int(self.config.get("num_batch", 1024)),
-                "num_keep": int(self.config.get("num_keep", 24)),
                 "repeat_penalty": float(self.config.get("repeat_penalty", 1.1)),
             }
+            
+            # Add optional parameters with validation (only if positive/valid)
+            num_thread = self.config.get("num_thread", 0)
+            if num_thread and int(num_thread) > 0:
+                options["num_thread"] = int(num_thread)
+            
+            num_batch = self.config.get("num_batch", 1024)
+            if num_batch and int(num_batch) > 0:
+                options["num_batch"] = int(num_batch)
+            
+            # num_keep: only include if positive (negative values can cause 400 errors)
+            num_keep = self.config.get("num_keep", 24)
+            if num_keep and int(num_keep) > 0:
+                options["num_keep"] = int(num_keep)
+            
+            return options
         except (ValueError, TypeError):
             return defaults
 
@@ -365,7 +473,9 @@ class MilexAgent:
             
             final_filename = filename
             if not final_filename:
-                final_filename = self.ui.ask_save_file(code, language)
+                # Auto-generate filename from code content
+                final_filename = _generate_filename_from_code(code, language)
+                self.ui.print_info(f"Auto-generated filename: {final_filename}")
             
             if final_filename:
                 write_res = await self.executor.execute_async("write_file", {"path": final_filename, "content": code})
@@ -441,13 +551,47 @@ class MilexAgent:
         return tool_calls
 
     def _extract_and_offer_code(self, text: str):
-        """No-op: the model now saves files proactively via write_file/edit_file tool calls.
-        
-        Previously this method would extract code blocks from the response and
-        prompt the user to save them. With the Gemini-CLI-style auto-save behavior,
-        the model is instructed to use tools directly, so this is no longer needed.
-        """
-        pass
+        """Extract code blocks from the response and auto-save them if a filename is mentioned."""
+        blocks = text.split("```")
+        for i in range(1, len(blocks), 2):
+            block = blocks[i]
+            if "\n" not in block:
+                continue
+                
+            header, code = block.split("\n", 1)
+            code = code.strip()
+            if not code:
+                continue
+                
+            filename = None
+            
+            # 1. Check header for filename (e.g. ```python test.py)
+            parts = header.strip().split()
+            if len(parts) > 1:
+                filename = parts[-1]
+                
+            # 2. Check preceding text for a filename right before the block
+            if not filename:
+                pre = blocks[i-1].strip()
+                # Matches patterns like: "save the file in the test.py" or "code for `test.py`:"
+                match = re.search(r'(?:file|in|to|as)\s+(?:the\s+)?\*?`?([a-zA-Z0-9_/\-]+\.[a-zA-Z0-9]+)`?\*?:?$', pre, re.IGNORECASE)
+                if match:
+                    filename = match.group(1)
+                    
+            # 3. Check first line comment of the code
+            if not filename:
+                first_line = code.split('\n')[0].strip()
+                match = re.search(r'^[#/*<!-]+\s*(?:file:\s*)?([a-zA-Z0-9_/\-]+\.[a-zA-Z0-9]+)\s*$', first_line, re.IGNORECASE)
+                if match:
+                    filename = match.group(1)
+                    
+            if filename:
+                # Auto save the file
+                res = self.executor.execute("write_file", {"path": filename, "content": code})
+                if res.get("success"):
+                    self.ui.print_success(f"Auto-saved code to {filename}")
+                else:
+                    self.ui.print_warning(f"Failed to auto-save {filename}: {res.get('error')}")
 
     def _extract_tool_call(self, tc) -> Tuple[str, dict]:
         fn = tc.function if hasattr(tc, "function") else tc.get("function", {})

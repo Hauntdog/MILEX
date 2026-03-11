@@ -410,6 +410,23 @@ TOOL_DEFINITIONS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "search_web",
+            "description": "Search the web for information using a search engine.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "The search query (e.g. 'how to write a bash script')",
+                    }
+                },
+                "required": ["query"],
+            },
+        },
+    },
 ]
 
 
@@ -530,6 +547,7 @@ class ToolExecutor:
             "rag_search": self._rag_search,
             "read_url_content": self._read_url_content,
             "read_files": self._read_files,
+            "search_web": self._search_web,
         }
 
         # Merge with plugins
@@ -881,3 +899,45 @@ class ToolExecutor:
             res = self._read_file(path)
             results[path] = res
         return {"files": results}
+
+    def _search_web(self, query: str) -> dict:
+        try:
+            import requests
+            from bs4 import BeautifulSoup
+            
+            headers = {"User-Agent": "Mozilla/5.0 (MILEX Bot; +http://example.com)"}
+            # Optional UI feedback using ThinkingSpinner if available
+            if self.ui:
+                with self.ui.create_thinking_spinner(f"Searching web for '{query}'..."):
+                    resp = requests.get(f"https://html.duckduckgo.com/html/?q={requests.utils.quote(query)}", headers=headers, timeout=10)
+            else:
+                resp = requests.get(f"https://html.duckduckgo.com/html/?q={requests.utils.quote(query)}", headers=headers, timeout=10)
+                
+            resp.raise_for_status()
+            soup = BeautifulSoup(resp.text, "html.parser")
+            
+            results = []
+            for result in soup.find_all("div", class_="result", limit=5):
+                title_a = result.find("a", class_="result__a")
+                snippet_a = result.find("a", class_="result__snippet")
+                if title_a and snippet_a:
+                    link = title_a.get("href", "")
+                    # Extract final URL from duckduckgo redirect format if possible
+                    if link.startswith("//duckduckgo.com/l/?") or link.startswith("https://duckduckgo.com/l/?"):
+                        import urllib.parse
+                        parsed = urllib.parse.urlparse(link)
+                        params = urllib.parse.parse_qs(parsed.query)
+                        if "uddg" in params:
+                            link = params["uddg"][0]
+                    
+                    results.append({
+                        "title": title_a.text.strip(),
+                        "link": link,
+                        "snippet": snippet_a.text.strip()
+                    })
+            if not results:
+                # Fallback if classes changed
+                return {"results": [{"snippet": "No structured results found, possible bot protection."}]}
+            return {"results": results}
+        except Exception as e:
+            return {"error": f"Failed to search web: {str(e)}"}
