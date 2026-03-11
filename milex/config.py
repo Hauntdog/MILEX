@@ -28,12 +28,12 @@ DEFAULT_CONFIG = {
     "show_thinking": True,
     "stream": True,
     "compact_mode": True,
-    # Air Logic — Nitro — CPU performance defaults
-    "num_batch": 1024,      # Aggressive prefill
-    "num_thread": 8,        # Tuned to physical core count (8) for Speed++
+    # Air Logic — Nitro — CPU performance defaults (optimized for 12-core)
+    "num_batch": 2048,      # Maximum prefill for faster processing
+    "num_thread": 12,        # Match physical CPU cores for maximum throughput
     "num_keep": -1,         # Pin entire system prompt in KV cache (Major Speedup)
-    "max_history": 15,      # Shorter history = faster inference
-    "cache_size": 32,       # Response cache size (items)
+    "max_history": 10,      # Minimal history = faster inference
+    "cache_size": 64,       # Larger response cache (items)
     "repeat_penalty": 1.1,  # Prevent repetitive outputs
     "allowed_root": None,
     "plugin_dir": str(CONFIG_DIR / "plugins"),

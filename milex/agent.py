@@ -5,8 +5,8 @@ import logging
 import re
 
 # Silence noisy background logs that break terminal spinners
-logging.getLogger("httpx").setLevel(logging.WARNING)
-logging.getLogger("httpcore").setLevel(logging.WARNING)
+logging.getLogger("httpx").setLevel(logging.ERROR)
+logging.getLogger("httpcore").setLevel(logging.ERROR)
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from functools import lru_cache
@@ -139,11 +139,6 @@ class MilexAgent:
         self.ui: AgentUI = ui or RichUI()
         self.conversation: List[Dict[str, Any]] = []
 
-        # Forcefully silence httpx logs from Ollama client
-        import logging
-        logging.getLogger("httpx").setLevel(logging.ERROR)
-        logging.getLogger("httpcore").setLevel(logging.ERROR)
-
         # RAG Manager
         self.rag: Optional[RagManager] = (
             RagManager(self.config) if self.config.get("rag", {}).get("enabled", True) else None
@@ -235,7 +230,7 @@ class MilexAgent:
     def _get_model_for_role(self, role: str) -> str:
         """Get model name for a role with caching."""
         if self._roles_dirty:
-            self._role_model_cache = dict(self.config.get("roles", {}))
+            self._role_model_cache = self.config.get("roles", {})
             self._roles_dirty = False
         return self._role_model_cache.get(role, self.config["model"])
 
@@ -279,7 +274,7 @@ class MilexAgent:
         defaults = {
             "temperature": 0.7,
             "num_predict": 2048,
-            "num_ctx": 4096,
+            "num_ctx": 2048,  # Match config for CPU optimization
         }
         try:
             temp = override_temp if override_temp is not None else self.config.get("temperature", 0.7)
@@ -290,18 +285,19 @@ class MilexAgent:
                 "repeat_penalty": float(self.config.get("repeat_penalty", 1.1)),
             }
             
-            # Add optional parameters with validation (only if positive/valid)
-            num_thread = self.config.get("num_thread", 0)
-            if num_thread and int(num_thread) > 0:
+            # Add optional parameters with validation
+            num_thread = self.config.get("num_thread", 12)
+            if num_thread is not None and int(num_thread) > 0:
                 options["num_thread"] = int(num_thread)
             
-            num_batch = self.config.get("num_batch", 1024)
-            if num_batch and int(num_batch) > 0:
+            num_batch = self.config.get("num_batch", 2048)
+            if num_batch is not None and int(num_batch) > 0:
                 options["num_batch"] = int(num_batch)
             
-            # num_keep: only include if positive (negative values can cause 400 errors)
-            num_keep = self.config.get("num_keep", 24)
-            if num_keep and int(num_keep) > 0:
+            # num_keep: -1 means keep all tokens in KV cache (major speedup)
+            # Only skip if explicitly set to 0 (disabled)
+            num_keep = self.config.get("num_keep", -1)
+            if num_keep is not None and int(num_keep) != 0:
                 options["num_keep"] = int(num_keep)
             
             return options

@@ -3,7 +3,7 @@
 # Works in VSCode terminal, Kali terminal, and any other terminal
 # Usage: ollama-ask [model] "your prompt"
 
-MODEL="${1:-qwen2.5:1.5b}"
+MODEL="${1:-qwen2.5:7b}"
 shift
 
 if [ -z "$1" ]; then

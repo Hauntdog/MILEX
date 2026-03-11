@@ -15,6 +15,7 @@ from rich.syntax import Syntax
 from rich.table import Table
 from rich.text import Text
 from rich.theme import Theme
+import json
 
 # ─── Theme ───────────────────────────────────────────────────────────────────
 
@@ -78,37 +79,37 @@ def print_welcome(model: str, host: str):
 class AgentUI:
     """Abstract base class for AI agent UI handlers."""
 
-    def print_ai_message(self, text: str, model: str = "MILEX"):
+    def print_ai_message(self, text: str, model: str = "MILEX") -> None:
         raise NotImplementedError
 
-    def print_tool_call(self, tool_name: str, args: dict):
+    def print_tool_call(self, tool_name: str, args: dict) -> None:
         raise NotImplementedError
 
-    def print_tool_result(self, tool_name: str, result: dict, success: bool = True):
+    def print_tool_result(self, tool_name: str, result: dict, success: bool = True) -> None:
         raise NotImplementedError
 
-    def print_error(self, message: str):
+    def print_error(self, message: str) -> None:
         raise NotImplementedError
 
-    def print_success(self, message: str):
+    def print_success(self, message: str) -> None:
         raise NotImplementedError
 
-    def print_warning(self, message: str):
+    def print_warning(self, message: str) -> None:
         raise NotImplementedError
 
-    def print_info(self, message: str):
+    def print_info(self, message: str) -> None:
         raise NotImplementedError
 
     def confirm_tool(self, tool_name: str, args: dict) -> bool:
         raise NotImplementedError
 
-    def create_stream_renderer(self, model: str = "MILEX"):
+    def create_stream_renderer(self, model: str = "MILEX") -> "StreamRenderer":
         raise NotImplementedError
 
-    def create_thinking_spinner(self, message: str = "Thinking..."):
+    def create_thinking_spinner(self, message: str = "Thinking...") -> "ThinkingSpinner":
         raise NotImplementedError
 
-    def print_code_block(self, code: str, language: str = "python", filename: Optional[str] = None):
+    def print_code_block(self, code: str, language: str = "python", filename: Optional[str] = None) -> None:
         raise NotImplementedError
 
     def ask_save_file(self, code: str, language: str) -> Optional[str]:
@@ -124,29 +125,29 @@ class RichUI(AgentUI):
     def __init__(self, console_obj: Optional[Console] = None):
         self.console: Console = console_obj or console
 
-    def print_ai_message(self, text: str, model: str = "MILEX"):
-        return print_ai_message(text, model)
+    def print_ai_message(self, text: str, model: str = "MILEX") -> None:
+        print_ai_message(text, model)
 
-    def print_tool_call(self, tool_name: str, args: dict):
-        return print_tool_call(tool_name, args)
+    def print_tool_call(self, tool_name: str, args: dict) -> None:
+        print_tool_call(tool_name, args)
 
-    def print_tool_result(self, tool_name: str, result: dict, success: bool = True):
-        return print_tool_result(tool_name, result, success)
+    def print_tool_result(self, tool_name: str, result: dict, success: bool = True) -> None:
+        print_tool_result(tool_name, result, success)
 
-    def print_error(self, message: str):
-        return print_error(message)
+    def print_error(self, message: str) -> None:
+        print_error(message)
 
-    def print_success(self, message: str):
-        return print_success(message)
+    def print_success(self, message: str) -> None:
+        print_success(message)
 
-    def print_warning(self, message: str):
-        return print_warning(message)
+    def print_warning(self, message: str) -> None:
+        print_warning(message)
 
-    def print_info(self, message: str):
-        return print_info(message)
+    def print_info(self, message: str) -> None:
+        print_info(message)
 
-    def print_code_block(self, code: str, language: str = "python", filename: Optional[str] = None):
-        return print_code_block(code, language, filename)
+    def print_code_block(self, code: str, language: str = "python", filename: Optional[str] = None) -> None:
+        print_code_block(code, language, filename)
 
     def confirm_tool(self, tool_name: str, args: dict) -> bool:
         return confirm_tool_execution(tool_name, args)
@@ -214,8 +215,6 @@ def _render_markdown_with_syntax(text: str):
 
 def print_tool_call(tool_name: str, args: dict):
     """Display a tool call being executed."""
-    import json
-
     args_str = json.dumps(args, indent=2)
     console.print()
     console.print(
@@ -231,8 +230,6 @@ def print_tool_call(tool_name: str, args: dict):
 
 def print_tool_result(tool_name: str, result: dict, success: bool = True):
     """Display tool execution result. File operations get a compact summary."""
-    import json
-
     # Compact one-liner for file write/edit/append operations
     if success and tool_name in ("write_file", "edit_file", "append_file"):
         path = result.get("path", "?")
@@ -309,6 +306,7 @@ class StreamRenderer:
         self.model = model
         self.buffer = ""
         self._live: Optional[Live] = None
+        self._is_terminal = console.is_terminal
 
     def __enter__(self):
         self._is_terminal = console.is_terminal
@@ -354,8 +352,6 @@ class StreamRenderer:
             console.print()
 
     def _make_panel(self, text: str):
-        from rich.panel import Panel
-        from rich.markdown import Markdown
         return Panel(
             Markdown(text, code_theme="monokai", inline_code_theme="monokai"),
             title=f"[milex.ai]✦ {self.model}[/]",
@@ -405,8 +401,6 @@ class ThinkingSpinner:
 
 def confirm_tool_execution(tool_name: str, args: dict) -> bool:
     """Ask user to confirm a tool execution."""
-    import json
-
     console.print()
     console.print(
         Panel(

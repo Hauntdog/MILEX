@@ -7,7 +7,8 @@ import re
 import signal
 import sys
 from pathlib import Path
-from typing import Optional, Dict, Any, List
+from dataclasses import dataclass
+from typing import Optional, Dict, Any, List, Callable, Awaitable
 from dotenv import load_dotenv
 
 # Load environment variables from .env if it exists
@@ -328,16 +329,12 @@ def daemonize(log_path: Path = DAEMON_LOG) -> None:
     os.dup2(log_fd.fileno(), sys.stderr.fileno())
 
 
-# ─── Command Registry ───────────────────────────────────────────────────────────
-
-from dataclasses import dataclass
-from typing import Callable, Awaitable, Optional
-
+# ─── Command Registry & Prompt Toolkit ───────────────────────────────────────
 
 @dataclass
 class CommandHandler:
     """Represents a slash command handler."""
-    handler: Callable[["MilexAgent", list], Awaitable[bool]]
+    handler: Callable[["MilexAgent", str], Awaitable[bool]]
     min_args: int = 0
     description: str = ""
 
@@ -365,54 +362,12 @@ class CommandRegistry:
 command_registry = CommandRegistry()
 
 
-# ─── Prompt Toolkit Setup ─────────────────────────────────────────────────────
-
-# Commands are now registered via command_registry - generate list from registry
 def _get_slash_commands() -> List[str]:
     """Get list of slash commands from registry."""
     return ["/" + cmd.lstrip("/") for cmd in command_registry.list_commands()]
 
 
-SLASH_COMMANDS = _get_slash_commands()
-
-command_completer = WordCompleter(SLASH_COMMANDS, pattern=re.compile(r"[/\w]+"))
-
-
-# ─── Command Registry ───────────────────────────────────────────────────────────
-
-from dataclasses import dataclass
-from typing import Callable, Awaitable, Optional
-
-
-@dataclass
-class CommandHandler:
-    """Represents a slash command handler."""
-    handler: Callable[["MilexAgent", list], Awaitable[bool]]
-    min_args: int = 0
-    description: str = ""
-
-
-class CommandRegistry:
-    """Registry for slash commands - eliminates large if-elif chains."""
-
-    def __init__(self):
-        self._commands: Dict[str, CommandHandler] = {}
-
-    def register(self, name: str, handler: Callable, min_args: int = 0, description: str = ""):
-        """Register a command handler."""
-        self._commands[name] = CommandHandler(handler, min_args, description)
-
-    def get_handler(self, command: str) -> Optional[CommandHandler]:
-        """Get handler for a command."""
-        return self._commands.get(command)
-
-    def list_commands(self) -> List[str]:
-        """List all registered commands."""
-        return list(self._commands.keys())
-
-
-# Create global registry
-command_registry = CommandRegistry()
+command_completer = WordCompleter(_get_slash_commands, pattern=re.compile(r"[/\w]+"))
 
 
 def get_toolbar_text(cfg: dict) -> str:
@@ -695,18 +650,21 @@ async def handle_slash_command(cmd: str, agent: MilexAgent) -> bool:
 # ─── REPL Loops ───────────────────────────────────────────────────────────────
 
 
+def _create_prompt_session():
+    """Create a PromptSession if in a terminal."""
+    if not sys.stdin.isatty():
+        return None
+    return PromptSession(
+        history=FileHistory(str(CONFIG_DIR / "prompt_history")),
+        auto_suggest=AutoSuggestFromHistory(),
+        completer=command_completer,
+        style=PT_STYLE,
+    )
+
+
 async def run_interactive_daemon(client: DaemonClient, cfg: dict):
     """REPL that forwards to daemon."""
-    if sys.stdin.isatty():
-        session = PromptSession(
-            history=FileHistory(str(CONFIG_DIR / "prompt_history")),
-            auto_suggest=AutoSuggestFromHistory(),
-            completer=command_completer,
-            style=PT_STYLE,
-        )
-    else:
-        session = None
-
+    session = _create_prompt_session()
     history_log = load_history()
 
     while True:
@@ -742,16 +700,7 @@ async def run_interactive_daemon(client: DaemonClient, cfg: dict):
 
 async def run_interactive(agent: MilexAgent):
     """REPL for standalone mode."""
-    if sys.stdin.isatty():
-        session = PromptSession(
-            history=FileHistory(str(CONFIG_DIR / "prompt_history")),
-            auto_suggest=AutoSuggestFromHistory(),
-            completer=command_completer,
-            style=PT_STYLE,
-        )
-    else:
-        session = None
-
+    session = _create_prompt_session()
     agent.start_background_tasks()
     history_log = load_history()
 
