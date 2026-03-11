@@ -572,6 +572,33 @@ async def _cmd_run(cmd: str, agent: MilexAgent) -> bool:
     return True
 
 
+async def _cmd_research(cmd: str, agent: MilexAgent) -> bool:
+    """Handle /research command."""
+    parts = cmd.strip().split(maxsplit=1)
+    if len(parts) < 2:
+        print_error("Usage: /research <topic>")
+        return True
+        
+    topic = parts[1].strip()
+    safe_topic = re.sub(r'[^a-zA-Z0-9_\-]', '_', topic).strip('_')
+    if not safe_topic:
+        safe_topic = "topic"
+    filename = f"{safe_topic}_research.txt"
+    
+    print_info(f"Starting comprehensive research on: [bold]{topic}[/]. Report will be saved to [cyan]{filename}[/]")
+    
+    prompt = (
+        f"Execute a comprehensive research task on the following topic: '{topic}'.\n"
+        "Step 1: Use the `search_web` tool to gather as much detailed information as possible about this topic. Use it multiple times if you need to gather broad context.\n"
+        "Step 2: Consolidate the research into a highly detailed, well-organized text report.\n"
+        f"Step 3: Crucially, you MUST use the `write_file` tool to save the entire report directly into the file '{filename}'. Do not ask for permission, just use the tool.\n"
+        "Step 4: Once saved automatically, give me a brief conversational summary of what you learned."
+    )
+    # Forward the constructed prompt into the existing agent streaming flow
+    await agent.stream_chat(prompt)
+    return True
+
+
 async def _cmd_sysinfo(cmd: str, agent: MilexAgent) -> bool:
     """Handle /sysinfo command."""
     res = await agent.executor.execute_async("get_system_info", {})
@@ -643,6 +670,7 @@ command_registry.register("/auto", _cmd_auto, 0, "Toggle auto-execute mode")
 command_registry.register("/history", _cmd_history, 0, "Show conversation history")
 command_registry.register("/save", _cmd_save, 1, "Save conversation to file")
 command_registry.register("/code", _cmd_code, 2, "Generate code for a task")
+command_registry.register("/research", _cmd_research, 1, "Collect info on a topic and save to a txt file")
 command_registry.register("/run", _cmd_run, 1, "Run a shell command")
 command_registry.register("/sysinfo", _cmd_sysinfo, 0, "Show system information")
 command_registry.register("/sandbox", _cmd_sandbox, 0, "Set sandbox root directory")

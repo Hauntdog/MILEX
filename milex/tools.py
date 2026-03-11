@@ -903,41 +903,63 @@ class ToolExecutor:
     def _search_web(self, query: str) -> dict:
         try:
             import requests
+            import re
             from bs4 import BeautifulSoup
             
-            headers = {"User-Agent": "Mozilla/5.0 (MILEX Bot; +http://example.com)"}
-            # Optional UI feedback using ThinkingSpinner if available
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+            }
+            data = {"q": query}
+            
             if self.ui:
                 with self.ui.create_thinking_spinner(f"Searching web for '{query}'..."):
-                    resp = requests.get(f"https://html.duckduckgo.com/html/?q={requests.utils.quote(query)}", headers=headers, timeout=10)
+                    resp = requests.post("https://lite.duckduckgo.com/lite/", headers=headers, data=data, timeout=10)
             else:
-                resp = requests.get(f"https://html.duckduckgo.com/html/?q={requests.utils.quote(query)}", headers=headers, timeout=10)
+                resp = requests.post("https://lite.duckduckgo.com/lite/", headers=headers, data=data, timeout=10)
                 
             resp.raise_for_status()
             soup = BeautifulSoup(resp.text, "html.parser")
             
             results = []
-            for result in soup.find_all("div", class_="result", limit=5):
-                title_a = result.find("a", class_="result__a")
-                snippet_a = result.find("a", class_="result__snippet")
-                if title_a and snippet_a:
-                    link = title_a.get("href", "")
-                    # Extract final URL from duckduckgo redirect format if possible
-                    if link.startswith("//duckduckgo.com/l/?") or link.startswith("https://duckduckgo.com/l/?"):
-                        import urllib.parse
-                        parsed = urllib.parse.urlparse(link)
-                        params = urllib.parse.parse_qs(parsed.query)
-                        if "uddg" in params:
-                            link = params["uddg"][0]
-                    
-                    results.append({
-                        "title": title_a.text.strip(),
-                        "link": link,
-                        "snippet": snippet_a.text.strip()
-                    })
+            # Scrape lite.duckduckgo.com
+            for tr in soup.find_all("tr"):
+                td = tr.find("td", class_="result-snippet")
+                if td:
+                    prev_tr = tr.find_previous_sibling("tr")
+                    if prev_tr:
+                        title_a = prev_tr.find("a", class_="result-url") or prev_tr.find("a")
+                        if title_a:
+                            title = title_a.text.strip()
+                            link = title_a.get("href", "")
+                            # un-redirect the duckduckgo URL
+                            if "uddg=" in link:
+                                import urllib.parse
+                                parsed = urllib.parse.urlparse(link)
+                                params = urllib.parse.parse_qs(parsed.query)
+                                if "uddg" in params:
+                                    link = params["uddg"][0]
+                            snippet = td.text.strip()
+                            results.append({"title": title, "link": link, "snippet": snippet})
+                            if len(results) >= 5:
+                                break
+                                
+            # Wikipedia Fallback if duckduckgo fails entirely
             if not results:
-                # Fallback if classes changed
-                return {"results": [{"snippet": "No structured results found, possible bot protection."}]}
+                wiki_url = f"https://en.wikipedia.org/w/api.php?action=query&list=search&srsearch={requests.utils.quote(query)}&utf8=&format=json"
+                wiki_resp = requests.get(wiki_url, headers=headers, timeout=10)
+                if wiki_resp.status_code == 200:
+                    data = wiki_resp.json()
+                    for item in data.get("query", {}).get("search", [])[:5]:
+                        clean_snippet = re.sub(r'<[^>]+>', '', item.get("snippet", ""))
+                        results.append({
+                            "title": item.get("title", ""),
+                            "link": f"https://en.wikipedia.org/wiki/{requests.utils.quote(item.get('title', ''))}",
+                            "snippet": clean_snippet
+                        })
+                        
+            if not results:
+                return {"results": [{"snippet": "No structured results found, bot protection or no matches."}]}
             return {"results": results}
         except Exception as e:
             return {"error": f"Failed to search web: {str(e)}"}

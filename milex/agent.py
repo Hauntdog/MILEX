@@ -1,7 +1,12 @@
 import asyncio
 import hashlib
 import json
+import logging
 import re
+
+# Silence noisy background logs that break terminal spinners
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from functools import lru_cache
@@ -133,6 +138,11 @@ class MilexAgent:
         self.config: Dict[str, Any] = config or load_config()
         self.ui: AgentUI = ui or RichUI()
         self.conversation: List[Dict[str, Any]] = []
+
+        # Forcefully silence httpx logs from Ollama client
+        import logging
+        logging.getLogger("httpx").setLevel(logging.ERROR)
+        logging.getLogger("httpcore").setLevel(logging.ERROR)
 
         # RAG Manager
         self.rag: Optional[RagManager] = (
@@ -365,7 +375,11 @@ class MilexAgent:
         model = self._get_model_for_role("primary")
         
         try:
-            with self.ui.create_thinking_spinner() as spinner:
+            spinner_msg = "Thinking..."
+            if self.conversation and self.conversation[-1].get("role") == "tool":
+                spinner_msg = "Synthesizing response..."
+                
+            with self.ui.create_thinking_spinner(spinner_msg) as spinner:
                 stream = await self._chat_safe(
                     model=model,
                     messages=messages,
@@ -514,7 +528,11 @@ class MilexAgent:
     async def _call_model(self, messages: List[Dict]) -> Tuple[str, List]:
         model = self._get_model_for_role("primary")
         try:
-            with self.ui.create_thinking_spinner():
+            spinner_msg = "Thinking..."
+            if self.conversation and self.conversation[-1].get("role") == "tool":
+                spinner_msg = "Synthesizing response..."
+                
+            with self.ui.create_thinking_spinner(spinner_msg):
                 response = await self._chat_safe(
                     model=model, 
                     messages=messages, 

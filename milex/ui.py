@@ -124,22 +124,29 @@ class RichUI(AgentUI):
     def __init__(self, console_obj: Optional[Console] = None):
         self.console: Console = console_obj or console
 
-    def __getattr__(self, name: str):
-        """Delegate to module-level functions for common operations."""
-        # Map method names to module functions
-        func_map = {
-            "print_ai_message": print_ai_message,
-            "print_tool_call": print_tool_call,
-            "print_tool_result": print_tool_result,
-            "print_error": print_error,
-            "print_success": print_success,
-            "print_warning": print_warning,
-            "print_info": print_info,
-            "print_code_block": print_code_block,
-        }
-        if name in func_map:
-            return func_map[name]
-        raise AttributeError(f"'{type(self).__name__}' object has no attribute '{name}'")
+    def print_ai_message(self, text: str, model: str = "MILEX"):
+        return print_ai_message(text, model)
+
+    def print_tool_call(self, tool_name: str, args: dict):
+        return print_tool_call(tool_name, args)
+
+    def print_tool_result(self, tool_name: str, result: dict, success: bool = True):
+        return print_tool_result(tool_name, result, success)
+
+    def print_error(self, message: str):
+        return print_error(message)
+
+    def print_success(self, message: str):
+        return print_success(message)
+
+    def print_warning(self, message: str):
+        return print_warning(message)
+
+    def print_info(self, message: str):
+        return print_info(message)
+
+    def print_code_block(self, code: str, language: str = "python", filename: Optional[str] = None):
+        return print_code_block(code, language, filename)
 
     def confirm_tool(self, tool_name: str, args: dict) -> bool:
         return confirm_tool_execution(tool_name, args)
@@ -326,46 +333,39 @@ class StreamRenderer:
             )
             self._live.__enter__()
         else:
-            # Simple header for daemon/piped output
-            console.print(f"\n[milex.ai]✦ {self.model}[/]")
-
-    def __exit__(self, *args):
-        if self._live:
-            self._live.update(self._make_panel(self.buffer))
-            self._live.__exit__(*args)
-        elif not self._is_terminal and self.buffer:
-            # If we were in non-TTY and never closed, just a newline
-            console.print()
+            console.print(f"\n[dim cyan]✦ {self.model}[/]\n", end="")
+        return self
 
     def update(self, chunk: str):
         if not self.buffer and chunk.strip():
             self._start_display()
 
         self.buffer += chunk
-        if self._live:
+        if self._is_terminal and self._live:
             self._live.update(self._make_panel(self.buffer + "▌"))
         elif not self._is_terminal and chunk:
-            # In daemon mode, just print raw text to the proxy console
-            # console.print handles formatting if enabled, but usually 
-            # we just want the raw stream to be forwarded.
-            console.print(chunk, end="", markup=False)
+            console.print(chunk, end="", markup=False, highlight=False)
+
+    def __exit__(self, *args):
+        if self._is_terminal and self._live:
+            self._live.update(self._make_panel(self.buffer))
+            self._live.__exit__(*args)
+        elif not self._is_terminal and self.buffer:
+            console.print()
 
     def _make_panel(self, text: str):
+        from rich.panel import Panel
+        from rich.markdown import Markdown
         return Panel(
             Markdown(text, code_theme="monokai", inline_code_theme="monokai"),
             title=f"[milex.ai]✦ {self.model}[/]",
             title_align="left",
-            border_style="blue",
+            border_style="cyan",
             padding=(0, 1),
         )
 
     def get_text(self) -> str:
         return self.buffer
-
-
-# ─── Spinner ────────────────────────────────────────────────────────────────
-
-
 class ThinkingSpinner:
     def __init__(self, message: str = "Thinking..."):
         self.message = message
@@ -389,6 +389,7 @@ class ThinkingSpinner:
     def __exit__(self, *args):
         if self._task is not None:
             self._progress.__exit__(*args)
+            self._task = None
         elif not console.is_terminal:
             console.print("[dim cyan]done[/]")
 
