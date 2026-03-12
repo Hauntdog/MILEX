@@ -2,6 +2,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import os
 import re
 
 # Silence noisy background logs that break terminal spinners
@@ -155,6 +156,7 @@ class MilexAgent:
             auto_execute=self.config.get("auto_execute", False),
         )
         self._client = ollama.AsyncClient(host=self.config["ollama_host"])
+        self.keep_alive = self.config.get("keep_alive", "30m")
 
         # Optimized response cache using LRU-style OrderedDict
         self._response_cache: OrderedDict[str, str] = OrderedDict()
@@ -209,7 +211,7 @@ class MilexAgent:
                     await self._client.chat(
                         model=model,
                         messages=[{"role": "user", "content": "ping"}],
-                        keep_alive="10m",
+                        keep_alive=self.keep_alive,
                         options={"num_predict": 1},
                     )
                 except Exception:
@@ -285,14 +287,17 @@ class MilexAgent:
                 "repeat_penalty": float(self.config.get("repeat_penalty", 1.1)),
             }
             
-            # Add optional parameters with validation
-            num_thread = self.config.get("num_thread", 12)
-            if num_thread is not None and int(num_thread) > 0:
-                options["num_thread"] = int(num_thread)
-            
-            num_batch = self.config.get("num_batch", 2048)
+            # CPU performance tuning: num_batch
+            # Lower batch size on CPU can improve Time To First Token (TTFT)
+            num_batch = self.config.get("num_batch", 512)
             if num_batch is not None and int(num_batch) > 0:
                 options["num_batch"] = int(num_batch)
+
+            # CPU performance tuning: num_thread
+            # Ideally matches the physical core count
+            num_thread = self.config.get("num_thread", os.cpu_count() or 4)
+            if num_thread is not None and int(num_thread) > 0:
+                options["num_thread"] = int(num_thread)
             
             # num_keep: -1 means keep all tokens in KV cache (major speedup)
             # Only skip if explicitly set to 0 (disabled)
@@ -381,7 +386,7 @@ class MilexAgent:
                     messages=messages,
                     tools=await self.executor.get_all_tools(),
                     stream=True,
-                    keep_alive="10m",
+                    keep_alive=self.keep_alive,
                     options=self._get_options(),
                 )
                 
