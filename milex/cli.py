@@ -145,13 +145,27 @@ class DaemonServer:
                 return False
 
             if mtype in ("chat", "stream_chat"):
-                # Capture output from agent and forward as chunks
+                # Use a queue to handle output chunks without flooding the event loop
+                output_queue = asyncio.Queue()
+                
+                async def sender_task():
+                    while True:
+                        item = await output_queue.get()
+                        if item is None: break
+                        await _send_msg(writer, item)
+                        output_queue.task_done()
+
+                sender = asyncio.create_task(sender_task())
+                
                 from .ui import console as ui_console
                 
                 class _WriterProxy:
                     def write(self_, data): # noqa
                         if data:
-                            asyncio.create_task(_send_msg(writer, {"type": "chunk", "content": data}))
+                            # Put message in queue instead of creating a new task for每一 chunk
+                            asyncio.get_running_loop().call_soon_threadsafe(
+                                output_queue.put_nowait, {"type": "chunk", "content": data}
+                            )
                     def flush(self_): pass
 
                 old_file = ui_console.file
@@ -163,6 +177,9 @@ class DaemonServer:
                         await self.agent.chat(content)
                 finally:
                     ui_console.file = old_file
+                    await output_queue.put(None) # Signal end
+                    await sender
+                    
                 await _send_msg(writer, {"type": "done"})
                 return True
 

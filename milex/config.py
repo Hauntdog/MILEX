@@ -22,19 +22,19 @@ DEFAULT_CONFIG = {
     "daemon_token": None,  # Will be generated in load_config
     "theme": "dark",
     "max_tokens": 2048,
-    "num_ctx": 2048,        # Optimized for CPU "Air" performance
-    "temperature": 0.7,
+    "num_ctx": 4096,        # Maintain context for persona
+    "temperature": 0.5,     # Lower for even more stability
     "auto_execute": False,
     "show_thinking": True,
     "stream": True,
     "compact_mode": True,
-    # Air Logic — Nitro — CPU performance defaults (optimized for 12-core)
-    "num_batch": 2048,      # Maximum prefill for faster processing
-    "num_thread": 12,        # Match physical CPU cores for maximum throughput
-    "num_keep": -1,         # Pin entire system prompt in KV cache (Major Speedup)
-    "max_history": 10,      # Minimal history = faster inference
-    "cache_size": 64,       # Larger response cache (items)
-    "repeat_penalty": 1.1,  # Prevent repetitive outputs
+    # Air Logic — Nitro — CPU performance defaults (optimized for low-end/Air)
+    "num_batch": 128,       # Much lower batch size to prevent long prefill pauses
+    "num_thread": 4,        # Conservative thread count
+    "num_keep": -1,         # Pin entire system prompt
+    "max_history": 8,       # Smaller history = faster inference
+    "cache_size": 32,       # Smaller cache to save RAM
+    "repeat_penalty": 1.25, # Higher penalty for stability
     "allowed_root": None,
     "plugin_dir": str(CONFIG_DIR / "plugins"),
     "mcp_servers": {

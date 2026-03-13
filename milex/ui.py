@@ -376,22 +376,33 @@ class ThinkingSpinner:
             transient=True,
         )
         self._task = None
+        self._is_started = False
 
     def start(self):
         if console.is_terminal:
-            self._progress.__enter__()
-            self._task = self._progress.add_task(self.message)
+            try:
+                self._progress.start()
+                self._task = self._progress.add_task(self.message)
+                self._is_started = True
+            except Exception:
+                # Fallback if Rich Progress fails (e.g., non-interactive terminal)
+                console.print(f"[dim cyan]● {self.message}[/]", end=" ", flush=True)
+                self._is_started = False # Indicate that Rich Progress didn't start
         else:
             # Headless mode: just a simple indicator
-            console.print(f"[dim cyan]● {self.message}[/]", end=" ")
+            console.print(f"[dim cyan]● {self.message}[/]", end=" ", flush=True)
+            self._is_started = False # Indicate that Rich Progress didn't start
         return self
 
     def stop(self, exc_type=None, exc_val=None, exc_tb=None):
-        if self._task is not None:
-            self._progress.__exit__(exc_type, exc_val, exc_tb)
+        if self._is_started and self._task is not None:
+            try:
+                self._progress.stop()
+            except Exception:
+                pass
             self._task = None
         elif not console.is_terminal:
-            console.print("[dim cyan]done[/]")
+            console.print("[dim cyan]done[/]", flush=True)
 
     def __enter__(self):
         return self.start()
