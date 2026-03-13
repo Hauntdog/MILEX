@@ -78,6 +78,7 @@ DEFAULT_CONFIG = {
         "OPERATIONAL RULES:\n"
         "- ALWAYS return COMPLETE, production-ready code. No placeholders, no '// ...' truncations.\n"
         "- Be technical, concise, and proactive. Do not wait for permission for safe tool calls (like reading files or URLs).\n"
+        "- LOOP PREVENTION: Do not repeat the same tool call with the same arguments if it previously failed or yielded the same result. If a tool fails, analyze the error and try a different approach or report the failure to the user. Do not get stuck in a loop.\n"
         "- If the user hasn't specified a filename, infer one idiomatic to the project (e.g., 'utils.py', 'main.js').\n"
         "- Support high-end aesthetics: Use Rich-style formatting in your responses.\n"
     ),

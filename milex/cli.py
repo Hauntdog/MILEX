@@ -55,6 +55,7 @@ from .ui import (
     print_warning,
     print_welcome,
 )
+from . import commands
 
 app = typer.Typer(
     name="milex",
@@ -385,251 +386,27 @@ def get_toolbar(agent: MilexAgent):
     return HTML(get_toolbar_text(agent.config))
 
 
-# ─── Command Handlers ─────────────────────────────────────────────────────────
+from . import commands
 
-
-async def _cmd_exit(cmd: str, agent: MilexAgent) -> bool:
-    """Handle /exit and /quit commands."""
-    return False
-
-
-async def _cmd_help(cmd: str, agent: MilexAgent) -> bool:
-    """Handle /help command."""
-    print_help()
-    return True
-
-
-async def _cmd_clear(cmd: str, agent: MilexAgent) -> bool:
-    """Handle /clear command."""
-    agent.clear_conversation()
-    return True
-
-
-async def _cmd_models(cmd: str, agent: MilexAgent) -> bool:
-    """Handle /models command."""
-    models = await agent.get_available_models()
-    if models:
-        print_models_table(models)
-    else:
-        print_warning("No models found. Make sure Ollama is running.")
-    return True
-
-
-async def _cmd_model(cmd: str, agent: MilexAgent) -> bool:
-    """Handle /model command."""
-    parts = cmd.strip().split(maxsplit=1)
-    if len(parts) < 2:
-        print_info(f"Current model: [bold cyan]{agent.config['model']}[/]")
-    else:
-        agent.switch_model(parts[1])
-    return True
-
-
-async def _cmd_config(cmd: str, agent: MilexAgent) -> bool:
-    """Handle /config command."""
-    print_config_table(agent.config)
-    return True
-
-
-async def _cmd_set(cmd: str, agent: MilexAgent) -> bool:
-    """Handle /set command."""
-    parts = cmd.strip().split(maxsplit=2)
-    if len(parts) < 3:
-        print_error("Usage: /set <key> <value>")
-        return True
-    key, value = parts[1], parts[2]
-    if value.lower() in ("true", "yes"):
-        typed = True
-    elif value.lower() in ("false", "no"):
-        typed = False
-    else:
-        try:
-            typed = int(value)
-        except ValueError:
-            try:
-                typed = float(value)
-            except ValueError:
-                typed = value
-    agent.config[key] = typed
-    save_config(agent.config)
-    print_success(f"Set [cyan]{key}[/] = [white]{typed}[/]")
-    return True
-
-
-async def _cmd_auto(cmd: str, agent: MilexAgent) -> bool:
-    """Handle /auto command."""
-    parts = cmd.strip().split(maxsplit=1)
-    val = parts[1].lower() in ("on", "true", "1", "yes") if len(parts) >= 2 else not agent.config.get("auto_execute")
-    agent.config["auto_execute"] = val
-    agent.executor.auto_execute = val
-    save_config(agent.config)
-    print_info(f"Auto-execute: {'[green]ON[/]' if val else '[red]OFF[/]'}")
-    return True
-
-
-async def _cmd_history(cmd: str, agent: MilexAgent) -> bool:
-    """Handle /history command."""
-    history = load_history()
-    if not history:
-        print_info("No history found.")
-    else:
-        from rich.table import Table
-        table = Table(title="Recent History")
-        table.add_column("#", width=4)
-        table.add_column("Input")
-        for i, entry in enumerate(history[-15:], 1):
-            table.add_row(str(i), entry.get("input", "")[:80])
-        console.print(table)
-    return True
-
-
-async def _cmd_save(cmd: str, agent: MilexAgent) -> bool:
-    """Handle /save command."""
-    parts = cmd.strip().split(maxsplit=1)
-    if len(parts) < 2:
-        print_error("Usage: /save <filename>")
-        return True
-    try:
-        Path(parts[1]).write_text(json.dumps({"conversation": agent.conversation}, indent=2))
-        print_success(f"Saved to {parts[1]}")
-    except Exception as e:
-        print_error(f"Save failed: {e}")
-    return True
-
-
-async def _cmd_code(cmd: str, agent: MilexAgent) -> bool:
-    """Handle /code command."""
-    parts = cmd.strip().split(maxsplit=2)
-    if len(parts) < 3:
-        print_error("Usage: /code <language> <task description>")
-        return True
-    lang, rest = parts[1], parts[2]
-    filename = None
-    save_match = re.search(r"--save\s+(\S+)", rest)
-    if save_match:
-        filename = save_match.group(1)
-        rest = rest.replace(save_match.group(0), "").strip()
-    await agent.generate_code_internal(rest, lang, filename)
-    return True
-
-
-async def _cmd_run(cmd: str, agent: MilexAgent) -> bool:
-    """Handle /run command."""
-    parts = cmd.strip().split(maxsplit=1)
-    if len(parts) < 2:
-        print_error("Usage: /run <shell command>")
-        return True
-    res = await agent.executor.execute_async("run_shell", {"command": cmd[5:].strip()})
-    if res.get("stdout"):
-        console.print(res["stdout"])
-    if res.get("stderr"):
-        console.print(f"[red]{res['stderr']}[/]")
-    return True
-
-
-async def _cmd_research(cmd: str, agent: MilexAgent) -> bool:
-    """Handle /research command."""
-    parts = cmd.strip().split(maxsplit=1)
-    if len(parts) < 2:
-        print_error("Usage: /research <topic>")
-        return True
-        
-    topic = parts[1].strip()
-    safe_topic = re.sub(r'[^a-zA-Z0-9_\-]', '_', topic).strip('_')
-    if not safe_topic:
-        safe_topic = "topic"
-    filename = f"{safe_topic}_research.txt"
-    
-    print_info(f"Starting comprehensive research on: [bold]{topic}[/]. Report will be saved to [cyan]{filename}[/]")
-    
-    prompt = (
-        f"Execute a comprehensive research task on the following topic: '{topic}'.\n"
-        "Step 1: Use the `search_web` tool to gather as much detailed information as possible about this topic. Use it multiple times if you need to gather broad context.\n"
-        "Step 2: Consolidate the research into a highly detailed, well-organized text report.\n"
-        f"Step 3: Crucially, you MUST use the `write_file` tool to save the entire report directly into the file '{filename}'. Do not ask for permission, just use the tool.\n"
-        "Step 4: Once saved automatically, give me a brief conversational summary of what you learned."
-    )
-    # Forward the constructed prompt into the existing agent streaming flow
-    await agent.stream_chat(prompt)
-    return True
-
-
-async def _cmd_sysinfo(cmd: str, agent: MilexAgent) -> bool:
-    """Handle /sysinfo command."""
-    res = await agent.executor.execute_async("get_system_info", {})
-    from rich.table import Table
-    table = Table(title="System Info")
-    for k, v in res.items():
-        table.add_row(k, str(v))
-    console.print(table)
-    return True
-
-
-async def _cmd_sandbox(cmd: str, agent: MilexAgent) -> bool:
-    """Handle /sandbox command."""
-    parts = cmd.strip().split(maxsplit=1)
-    if len(parts) < 2:
-        root = agent.config.get("allowed_root")
-        print_info(f"Sandbox Root: [bold green]{root or 'DISABLED'}[/]")
-    else:
-        val = parts[1]
-        if val.lower() in ("off", "none", "disable"):
-            agent.config["allowed_root"] = None
-        else:
-            p = Path(val).resolve()
-            if p.exists():
-                agent.config["allowed_root"] = str(p)
-            else:
-                print_error(f"Path invalid: {p}")
-    return True
-
-
-async def _cmd_telemetry(cmd: str, agent: MilexAgent) -> bool:
-    """Handle /telemetry command."""
-    from .telemetry import telemetry
-    from rich.table import Table
-    stats = telemetry.get_stats()
-    if not stats:
-        print_info("No telemetry data yet.")
-        return True
-    
-    table = Table(title="Tool Telemetry")
-    table.add_column("Tool")
-    table.add_column("Hits", justify="right")
-    table.add_column("Errors", justify="right", style="red")
-    table.add_column("Avg Latency", justify="right", style="cyan")
-    table.add_column("Max Latency", justify="right", style="magenta")
-    
-    for name, s in stats.items():
-        table.add_row(
-            name,
-            str(s["count"]),
-            str(s["errors"]),
-            f"{s['avg_ms']}ms",
-            f"{s['max_ms']}ms"
-        )
-    console.print(table)
-    return True
-
+# ... (rest of imports)
 
 # Register all commands
-command_registry.register("/exit", _cmd_exit, 0, "Exit MILEX")
-command_registry.register("/quit", _cmd_exit, 0, "Exit MILEX (alias)")
-command_registry.register("/help", _cmd_help, 0, "Show help message")
-command_registry.register("/clear", _cmd_clear, 0, "Clear conversation history")
-command_registry.register("/models", _cmd_models, 0, "List available Ollama models")
-command_registry.register("/model", _cmd_model, 0, "Switch Ollama model")
-command_registry.register("/config", _cmd_config, 0, "Show current configuration")
-command_registry.register("/set", _cmd_set, 2, "Set configuration value")
-command_registry.register("/auto", _cmd_auto, 0, "Toggle auto-execute mode")
-command_registry.register("/history", _cmd_history, 0, "Show conversation history")
-command_registry.register("/save", _cmd_save, 1, "Save conversation to file")
-command_registry.register("/code", _cmd_code, 2, "Generate code for a task")
-command_registry.register("/research", _cmd_research, 1, "Collect info on a topic and save to a txt file")
-command_registry.register("/run", _cmd_run, 1, "Run a shell command")
-command_registry.register("/sysinfo", _cmd_sysinfo, 0, "Show system information")
-command_registry.register("/sandbox", _cmd_sandbox, 0, "Set sandbox root directory")
-command_registry.register("/telemetry", _cmd_telemetry, 0, "Show tool performance stats")
+command_registry.register("/exit", commands.cmd_exit, 0, "Exit MILEX")
+command_registry.register("/quit", commands.cmd_exit, 0, "Exit MILEX (alias)")
+command_registry.register("/help", commands.cmd_help, 0, "Show help message")
+command_registry.register("/clear", commands.cmd_clear, 0, "Clear conversation history")
+command_registry.register("/models", commands.cmd_models, 0, "List available Ollama models")
+command_registry.register("/model", commands.cmd_model, 0, "Switch Ollama model")
+command_registry.register("/config", commands.cmd_config, 0, "Show current configuration")
+command_registry.register("/set", commands.cmd_set, 2, "Set configuration value")
+command_registry.register("/auto", commands.cmd_auto, 0, "Toggle auto-execute mode")
+command_registry.register("/history", commands.cmd_history, 0, "Show conversation history")
+command_registry.register("/save", commands.cmd_save, 1, "Save conversation to file")
+command_registry.register("/code", commands.cmd_code, 2, "Generate code for a task")
+command_registry.register("/research", commands.cmd_research, 1, "Collect info on a topic and save to a txt file")
+command_registry.register("/run", commands.cmd_run, 1, "Run a shell command")
+command_registry.register("/sysinfo", commands.cmd_sysinfo, 0, "Show system information")
+command_registry.register("/telemetry", commands.cmd_telemetry, 0, "Show tool performance stats")
 
 
 async def handle_slash_command(cmd: str, agent: MilexAgent) -> bool:

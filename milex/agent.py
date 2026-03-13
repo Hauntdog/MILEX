@@ -35,6 +35,7 @@ from .ui import (
     print_tool_result,
     print_warning,
 )
+from .utils import generate_filename_from_code, get_cache_key
 
 
 @dataclass
@@ -42,6 +43,7 @@ class ToolCall:
     """Represents a parsed tool call from the model."""
     name: str
     arguments: Dict[str, Any]
+    id: Optional[str] = None
     raw: Optional[Dict] = None
 
 
@@ -53,79 +55,6 @@ class Message:
     tool_calls: Optional[List[ToolCall]] = None
 
 
-def _generate_filename_from_code(code: str, language: str) -> str:
-    """Generate a sensible filename from code content.
-    
-    Analyzes the code to find meaningful names (functions, classes, shebangs)
-    and creates an appropriate filename.
-    """
-    # Language to extension mapping
-    ext_map = {
-        "python": ".py",
-        "bash": ".sh",
-        "sh": ".sh",
-        "shell": ".sh",
-        "javascript": ".js",
-        "js": ".js",
-        "typescript": ".ts",
-        "ts": ".ts",
-        "rust": ".rs",
-        "go": ".go",
-        "java": ".java",
-        "c": ".c",
-        "cpp": ".cpp",
-        "c++": ".cpp",
-        "ruby": ".rb",
-        "php": ".php",
-        "html": ".html",
-        "css": ".css",
-        "json": ".json",
-        "yaml": ".yaml",
-        "yml": ".yml",
-        "sql": ".sql",
-        "markdown": ".md",
-        "md": ".md",
-    }
-    
-    ext = ext_map.get(language.lower(), ".txt")
-    
-    # For shell scripts, check shebang
-    if language.lower() in ("bash", "sh", "shell"):
-        shebang_match = re.search(r"^#!.*/(bash|sh|zsh|fish)", code, re.MULTILINE)
-        if shebang_match:
-            return f"script{ext}"
-    
-    # Try to find function or class name
-    # Match function definitions: def function_name, func function_name, fn function_name
-    func_match = re.search(r"^\s*(?:def|func|fn)\s+([a-zA-Z_][a-zA-Z0-9_]*)", code, re.MULTILINE)
-    if func_match:
-        name = func_match.group(1)
-        # Filter out common non-meaningful names
-        if name not in ("main", "init", "__init__", "start", "run", "test"):
-            return f"{name}{ext}"
-    
-    # Match class definitions
-    class_match = re.search(r"^\s*class\s+([A-Z][a-zA-Z0-9_]*)", code, re.MULTILINE)
-    if class_match:
-        return f"{class_match.group(1).lower()}{ext}"
-    
-    # Match main function as fallback
-    if re.search(r"^\s*(?:def|func|fn)\s+main\s*\(", code, re.MULTILINE):
-        return f"main{ext}"
-    
-    # Look for common script patterns
-    if language.lower() in ("bash", "sh", "shell"):
-        # Check for specific purpose in comments
-        comment_match = re.search(r"^\s*#.*(?:backup|deploy|install|setup|deploy|test|cleanup|deploy)\s+.*$", code, re.MULTILINE | re.IGNORECASE)
-        if comment_match:
-            purpose = comment_match.group(0).split()[-1].strip().lower()
-            return f"{purpose}{ext}"
-    
-    # Default filename based on language
-    if language.lower() in ("python", "bash", "sh", "shell", "javascript", "typescript"):
-        return f"script{ext}"
-    
-    return f"generated{ext}"
 
 
 class MilexAgent:
@@ -164,6 +93,10 @@ class MilexAgent:
 
         # Keepalive control
         self._keepalive_task: Optional[asyncio.Task] = None
+
+        # Loop detection
+        self._last_tool_calls: List[str] = []
+        self._max_repeat_threshold: int = 3
 
         # Cache for model roles to avoid repeated dict lookups
         self._role_model_cache: Dict[str, str] = {}
@@ -219,15 +152,7 @@ class MilexAgent:
             await asyncio.sleep(300)
 
     def _get_cache_key(self, messages: List[Dict]) -> str:
-        """Hash for current session state."""
-        normalized = []
-        for m in messages:
-            n = {"role": m["role"], "content": (m.get("content") or "").strip()}
-            if "tool_calls" in m:
-                n["tool_calls"] = m["tool_calls"]
-            normalized.append(n)
-        raw = f"{self.config['model']}:{json.dumps(normalized, sort_keys=True)}"
-        return hashlib.sha256(raw.encode()).hexdigest()
+        return get_cache_key(messages, self.config["model"])
 
     def _get_model_for_role(self, role: str) -> str:
         """Get model name for a role with caching."""
@@ -315,6 +240,7 @@ class MilexAgent:
         """Send message, handle tools, get response."""
         self.conversation.append({"role": "user", "content": user_input})
         self._prune_history()
+        self._last_tool_calls.clear()
 
         max_rounds = self.config.get("max_tool_rounds", 10)
         for _round in range(max_rounds):
@@ -347,6 +273,7 @@ class MilexAgent:
         """Streaming async response."""
         self.conversation.append({"role": "user", "content": user_input})
         self._prune_history()
+        self._last_tool_calls.clear()
 
         max_rounds = self.config.get("max_tool_rounds", 10)
         for _round in range(max_rounds):
@@ -380,7 +307,9 @@ class MilexAgent:
             if self.conversation and self.conversation[-1].get("role") == "tool":
                 spinner_msg = "Synthesizing response..."
                 
-            with self.ui.create_thinking_spinner(spinner_msg) as spinner:
+            spinner = self.ui.create_thinking_spinner(spinner_msg)
+            spinner.start()
+            try:
                 stream = await self._chat_safe(
                     model=model,
                     messages=messages,
@@ -390,20 +319,31 @@ class MilexAgent:
                     options=self._get_options(),
                 )
                 
+                tool_calls_dict = {}
                 with self.ui.create_stream_renderer(model=model) as renderer:
                     async for chunk in stream:
                         if spinner:
-                            spinner.__exit__(None, None, None)
-                            spinner = None # type: ignore
+                            spinner.stop()
+                            spinner = None
                         
                         msg = chunk.get("message", {})
+                        
+                        # Handle tool calls (deduplicate by index or ID)
                         if msg.get("tool_calls"):
-                            tool_calls.extend(msg["tool_calls"])
+                            for i, tc in enumerate(msg["tool_calls"]):
+                                # Use index as key if ID is missing (Ollama style)
+                                tc_id = getattr(tc, "id", None) or tc.get("id") or str(i)
+                                tool_calls_dict[tc_id] = tc
                         
                         delta = msg.get("content", "")
                         if delta:
                             full_text += delta
                             renderer.update(delta)
+                
+                tool_calls = list(tool_calls_dict.values())
+            finally:
+                if spinner:
+                    spinner.stop()
 
             if not tool_calls and full_text:
                 tool_calls = self._parse_inline_tool_calls(full_text)
@@ -425,13 +365,35 @@ class MilexAgent:
     async def _process_tool_calls(self, response_text: Optional[str], tool_calls: List[Any]):
         """Execute tools in parallel using asyncio.gather."""
         clean_calls = []
+        unique_call_hashes = []
+
         for tc in tool_calls:
-            if hasattr(tc, "model_dump"):
-                clean_calls.append(tc.model_dump())
-            elif isinstance(tc, dict):
-                clean_calls.append(tc)
-            else:
-                clean_calls.append(str(tc))
+            name, args, call_id = self._extract_tool_call(tc)
+            call_hash = f"{name}:{json.dumps(args, sort_keys=True)}"
+            unique_call_hashes.append(call_hash)
+            
+            call_dict = {
+                "function": {
+                    "name": name,
+                    "arguments": args,
+                }
+            }
+            if call_id:
+                call_dict["id"] = call_id
+            clean_calls.append(call_dict)
+
+        # Detect loop
+        current_batch_hash = "|".join(sorted(unique_call_hashes))
+        self._last_tool_calls.append(current_batch_hash)
+        
+        # If we see the same batch of tool calls multiple times, it's a loop
+        if self._last_tool_calls.count(current_batch_hash) >= self._max_repeat_threshold:
+            self.ui.print_error("Detected tool call loop. Aborting current execution.")
+            self.conversation.append({
+                "role": "assistant",
+                "content": "I apologize, but I've entered a repetitive loop of tool calls. I'm stopping to prevent further issues."
+            })
+            return
 
         self.conversation.append({
             "role": "assistant",
@@ -440,25 +402,28 @@ class MilexAgent:
         })
         
         tasks = []
-        for call_obj in tool_calls:
-            name, args = self._extract_tool_call(call_obj)
+        for tc in tool_calls:
+            name, args, call_id = self._extract_tool_call(tc)
             self.ui.print_tool_call(name, args)
-            tasks.append(self._execute_and_wrap(name, args))
+            tasks.append(self._execute_and_wrap(name, args, call_id))
 
         results = await asyncio.gather(*tasks)
-        for name, result in results:
+        for name, result, call_id in results:
             success = "error" not in result and result.get("status") != "cancelled"
             self.ui.print_tool_result(name, result, success=success)
-            self.conversation.append({"role": "tool", "content": json.dumps(result)})
+            
+            tool_msg = {"role": "tool", "content": json.dumps(result)}
+            if call_id:
+                tool_msg["tool_call_id"] = call_id
+            self.conversation.append(tool_msg)
 
-    async def _execute_and_wrap(self, name, args):
+    async def _execute_and_wrap(self, name, args, call_id=None):
         """Small wrapper for tool execution in gather."""
         try:
-            # We assume executor.execute is either async or wrapped in thread
             result = await self.executor.execute_async(name, args)
-            return name, result
+            return name, result, call_id
         except Exception as exc:
-            return name, {"error": str(exc)}
+            return name, {"error": str(exc)}, call_id
 
     async def generate_code_internal(self, task: str, language: str, filename: Optional[str] = None) -> dict:
         """Coder specialist task."""
@@ -489,7 +454,7 @@ class MilexAgent:
             final_filename = filename
             if not final_filename:
                 # Auto-generate filename from code content
-                final_filename = _generate_filename_from_code(code, language)
+                final_filename = generate_filename_from_code(code, language)
                 self.ui.print_info(f"Auto-generated filename: {final_filename}")
             
             if final_filename:
@@ -612,14 +577,29 @@ class MilexAgent:
                 else:
                     self.ui.print_warning(f"Failed to auto-save {filename}: {res.get('error')}")
 
-    def _extract_tool_call(self, tc) -> Tuple[str, dict]:
-        fn = tc.function if hasattr(tc, "function") else tc.get("function", {})
-        name = fn.name if hasattr(fn, "name") else fn.get("name")
-        args = fn.arguments if hasattr(fn, "arguments") else fn.get("arguments", {})
+    def _extract_tool_call(self, tc) -> Tuple[str, dict, Optional[str]]:
+        """Extract tool call components with ID support."""
+        if hasattr(tc, "function"):
+            fn = tc.function
+            name = getattr(fn, "name", None)
+            args = getattr(fn, "arguments", {})
+            call_id = getattr(tc, "id", None)
+        elif isinstance(tc, dict):
+            # Support both function-nested and flat formats
+            fn = tc.get("function", tc)
+            name = fn.get("name")
+            args = fn.get("arguments", fn.get("args", {}))
+            call_id = tc.get("id")
+        else:
+            name = str(tc)
+            args = {}
+            call_id = None
+            
         if isinstance(args, str):
             try: args = json.loads(args)
             except: args = {}
-        return name, (args or {})
+            
+        return (name or ""), (args or {}), call_id
 
     async def get_available_models(self):
         try: 

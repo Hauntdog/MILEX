@@ -345,9 +345,13 @@ class StreamRenderer:
             console.print(chunk, end="", markup=False, highlight=False)
 
     def __exit__(self, *args):
-        if self._is_terminal and self._live:
-            self._live.update(self._make_panel(self.buffer))
-            self._live.__exit__(*args)
+        if self._is_terminal and self._live is not None:
+            try:
+                self._live.update(self._make_panel(self.buffer))
+                self._live.__exit__(*args)
+            except Exception:
+                pass
+            self._live = None
         elif not self._is_terminal and self.buffer:
             console.print()
 
@@ -373,7 +377,7 @@ class ThinkingSpinner:
         )
         self._task = None
 
-    def __enter__(self):
+    def start(self):
         if console.is_terminal:
             self._progress.__enter__()
             self._task = self._progress.add_task(self.message)
@@ -382,15 +386,22 @@ class ThinkingSpinner:
             console.print(f"[dim cyan]● {self.message}[/]", end=" ")
         return self
 
-    def __exit__(self, *args):
+    def stop(self, *args):
         if self._task is not None:
             self._progress.__exit__(*args)
             self._task = None
         elif not console.is_terminal:
             console.print("[dim cyan]done[/]")
 
+    def __enter__(self):
+        return self.start()
+
+    def __exit__(self, *args):
+        self.stop(*args)
+
     def update(self, message: str):
-        if self._task is not None:
+        self.message = message
+        if self._task is not None and self._progress is not None:
             self._progress.update(self._task, description=f"[dim cyan]{message}[/]")
         elif not console.is_terminal:
             console.print(f"\n[dim cyan]● {message}[/]", end=" ", flush=True)
