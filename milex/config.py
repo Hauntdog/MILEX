@@ -21,8 +21,7 @@ DEFAULT_CONFIG = {
     "ollama_host": "http://localhost:11434",
     "daemon_token": None,  # Will be generated in load_config
     "provider": "ollama",   # Current options: ollama, openai, anthropic
-    "openai_key": None,
-    "anthropic_key": None,
+    "gemini_key": None,
     "theme": "dark",
     "max_tokens": 4096,     # Larger output limit
     "num_ctx": 16384,       # Larger context for complex agentic loops

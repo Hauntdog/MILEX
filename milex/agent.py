@@ -16,14 +16,9 @@ from typing import Any, Callable, Dict, Generator, List, Optional, Tuple, Union
 import ollama
 
 try:
-    from openai import AsyncOpenAI
+    import google.generativeai as genai
 except ImportError:
-    AsyncOpenAI = None
-
-try:
-    from anthropic import AsyncAnthropic
-except ImportError:
-    AsyncAnthropic = None
+    genai = None
 
 from .config import load_config, save_config
 from .tools import TOOL_DEFINITIONS, ToolExecutor
@@ -113,8 +108,7 @@ class MilexAgent:
         self._roles_dirty: bool = True
 
         # Multi-provider clients
-        self._openai_client = None
-        self._anthropic_client = None
+        self._gemini_client = None
 
     def start_background_tasks(self):
         """Must be called within an event loop."""
@@ -185,33 +179,22 @@ class MilexAgent:
             return self.config["provider"]
             
         name = model_name.lower()
-        if name.startswith("gpt-") or name.startswith("o1-"):
-            return "openai"
-        if name.startswith("claude-"):
-            return "anthropic"
+        if name.startswith("gemini-"):
+            return "gemini"
         return "ollama"
 
     async def _get_client(self, provider: str):
         """Get or initialize the appropriate provider client."""
-        if provider == "openai":
-            if not self._openai_client:
-                if not AsyncOpenAI:
-                    raise ImportError("OpenAI SDK not installed. Run 'pip install openai'")
-                key = self.config.get("openai_key")
+        if provider == "gemini":
+            if not self._gemini_client:
+                if not genai:
+                    raise ImportError("Google GenerativeAI SDK not installed. Run 'pip install google-generativeai'")
+                key = self.config.get("gemini_key")
                 if not key:
-                    raise ValueError("OpenAI API key missing. Set 'openai_key' in config.")
-                self._openai_client = AsyncOpenAI(api_key=key)
-            return self._openai_client
-        
-        if provider == "anthropic":
-            if not self._anthropic_client:
-                if not AsyncAnthropic:
-                    raise ImportError("Anthropic SDK not installed. Run 'pip install anthropic'")
-                key = self.config.get("anthropic_key")
-                if not key:
-                    raise ValueError("Anthropic API key missing. Set 'anthropic_key' in config.")
-                self._anthropic_client = AsyncAnthropic(api_key=key)
-            return self._anthropic_client
+                    raise ValueError("Gemini API key missing. Set 'gemini_key' in config.")
+                genai.configure(api_key=key)
+                self._gemini_client = genai
+            return self._gemini_client
             
         return self._client
 
@@ -402,77 +385,64 @@ class MilexAgent:
                                     self.ui.print_warning("Streaming loop detected. Breaking.")
                                     break
                     
-                    elif provider == "openai":
-                        o_client = await self._get_client("openai")
-                        tools = await self.executor.get_all_tools()
-                        stream = await o_client.chat.completions.create(
-                            model=model,
-                            messages=messages,
-                            tools=tools,
-                            stream=True,
-                            temperature=self.config.get("temperature", 0.4),
-                            max_tokens=self.config.get("max_tokens", 4096),
+                    elif provider == "gemini":
+                        # Directly use the member to assist type inference/linting if needed
+                        await self._get_client("gemini")
+                        g_client = self._gemini_client
+                        if not g_client:
+                            raise ValueError("Gemini client not initialized")
+                            
+                        tools_g = await self.executor.get_all_tools()
+                        gemini_tools = []
+                        if tools_g:
+                            gemini_tools = [{"function_declarations": [t["function"] for t in tools_g]}]
+                        
+                        sys_instr = next((m["content"] for m in messages if m["role"] == "system"), None)
+                        model_g = g_client.GenerativeModel(
+                            model_name=model,
+                            tools=gemini_tools if gemini_tools else None,
+                            system_instruction=sys_instr
                         )
-                        async for chunk in stream:
-                            if not chunk.choices: continue
-                            delta = chunk.choices[0].delta
-                            if delta.content:
-                                full_text += delta.content
-                                renderer.update(delta.content)
+                        
+                        # Convert history
+                        history = []
+                        for m in messages:
+                            if m["role"] == "system": continue
+                            role = "user" if m["role"] in ("user", "tool") else "model"
+                            content = m.get("content") or ""
+                            history.append({"role": role, "parts": [content]})
+                        
+                        current_msg = history.pop() if history else {"role": "user", "parts": [""]}
+                        chat = model_g.start_chat(history=history or None)
+                        
+                        response_stream = await chat.send_message_async(current_msg["parts"][0], stream=True)
+                        async for chunk in response_stream:
+                            # Handle text part safely
+                            chunk_text = ""
+                            try:
+                                chunk_text = chunk.text
+                            except (ValueError, IndexError):
+                                pass
+                                
+                            if chunk_text:
+                                full_text += chunk_text
+                                renderer.update(chunk_text)
                                 if self._detect_streaming_loop(full_text):
                                     self.ui.print_warning("Streaming loop detected. Breaking.")
-                                    break
-                            if delta.tool_calls:
-                                for tc in delta.tool_calls:
-                                    tc_id = tc.id or str(len(tool_calls_dict))
-                                    if tc_id not in tool_calls_dict:
-                                        tool_calls_dict[tc_id] = {"id": tc_id, "function": {"name": "", "arguments": ""}}
-                                    
-                                    # Collect function name if available
-                                    if hasattr(tc, 'function') and tc.function.name:
-                                        tool_calls_dict[tc_id]["function"]["name"] = tc.function.name
-                                    
-                                    # Collect arguments if available
-                                    if hasattr(tc, 'function') and tc.function.arguments:
-                                        tool_calls_dict[tc_id]["function"]["arguments"] += tc.function.arguments
-
-                    elif provider == "anthropic":
-                        client_a = await self._get_client("anthropic")
-                        tools_a = await self.executor.get_all_tools()
-                        anthropic_tools = []
-                        for t in tools_a:
-                            anthropic_tools.append({
-                                "name": t["function"]["name"],
-                                "description": t["function"]["description"],
-                                "input_schema": t["function"]["parameters"]
-                            })
-                        
-                        system_msg = next((m["content"] for m in messages if m["role"] == "system"), "")
-                        user_messages = [m for m in messages if m["role"] != "system"]
-                        
-                        # Corrected Anthropic streaming pattern
-                        async with client_a.messages.stream(
-                            model=model,
-                            max_tokens=self.config.get("max_tokens", 4096),
-                            system=system_msg,
-                            messages=user_messages,
-                            tools=anthropic_tools,
-                        ) as stream_a:
-                            async for text in stream_a.text_stream:
-                                full_text += text
-                                renderer.update(text)
-                                if self._detect_streaming_loop(full_text):
-                                    self.ui.print_warning("Streaming loop detected. Breaking.")
-                                    # Interrupting a stream requires careful closing
                                     break
                             
-                            final_msg = await stream_a.get_final_message()
-                            for block in final_msg.content:
-                                if block.type == "tool_use":
-                                    tool_calls_dict[block.id] = {
-                                        "id": block.id,
-                                        "function": {"name": block.name, "arguments": json.dumps(block.input)}
-                                    }
+                            # Check for tool calls
+                            if chunk.candidates and chunk.candidates[0].content.parts:
+                                for part in chunk.candidates[0].content.parts:
+                                    if part.function_call:
+                                        call = part.function_call
+                                        tc_id = f"call_{hashlib.md5(call.name.encode()).hexdigest()[:8]}"
+                                        name = call.name
+                                        args = dict(call.args)
+                                        tool_calls_dict[tc_id] = {
+                                            "id": tc_id,
+                                            "function": {"name": name, "arguments": json.dumps(args)}
+                                        }
                 
                 # Close renderer and proceed
                 if spinner:
@@ -677,36 +647,60 @@ class MilexAgent:
                     text = msg.content or ""
                     tool_calls = msg.tool_calls or []
                 
-                elif provider == "openai":
-                    o_client_nc = await self._get_client("openai")
-                    # Ensure we have the actual client and not a coroutine
-                    o_response = await o_client_nc.chat.completions.create(
-                        model=model,
-                        messages=messages,
-                        tools=await self.executor.get_all_tools(),
-                        temperature=self.config.get("temperature", 0.4),
-                    )
-                    text = o_response.choices[0].message.content or ""
-                    tool_calls = o_response.choices[0].message.tool_calls or []
-                
-                elif provider == "anthropic":
-                    a_client = await self._get_client("anthropic")
-                    tools_a = await self.executor.get_all_tools()
-                    system_a = messages[0]["content"] if messages[0]["role"] == "system" else ""
-                    msgs_a = [m for m in messages if m["role"] != "system"]
+                elif provider == "gemini":
+                    await self._get_client("gemini")
+                    g_client = self._gemini_client
+                    if not g_client:
+                        raise ValueError("Gemini client not initialized")
+                        
+                    tools_g = await self.executor.get_all_tools()
+                    gemini_tools = []
+                    if tools_g:
+                        gemini_tools = [{"function_declarations": [t["function"] for t in tools_g]}]
                     
-                    response_a = await a_client.messages.create(
-                        model=model,
-                        max_tokens=4096,
-                        system=system_a,
-                        messages=msgs_a,
-                        tools=[{"name": t["function"]["name"], "description": t["function"]["description"], "input_schema": t["function"]["parameters"]} for t in tools_a]
+                    model_g = g_client.GenerativeModel(
+                        model_name=model,
+                        tools=gemini_tools if gemini_tools else None
                     )
-                    text = "".join(b.text for b in response_a.content if b.type == "text")
+                    
+                    # Manual conversion of messages to Gemini format
+                    history = []
+                    for m in messages:
+                        if m["role"] == "system": continue
+                        role = "user" if m["role"] in ("user", "tool") else "model"
+                        content = m.get("content") or ""
+                        # Note: tool results in Gemini are complex, for now we simplify to text
+                        history.append({"role": role, "parts": [content]})
+                    
+                    # Last message is the current one
+                    current_msg = history.pop() if history else {"role": "user", "parts": [""]}
+                    
+                    # System instruction
+                    sys_instr = next((m["content"] for m in messages if m["role"] == "system"), None)
+                    if sys_instr:
+                        model_g = g_client.GenerativeModel(
+                            model_name=model,
+                            tools=gemini_tools if gemini_tools else None,
+                            system_instruction=sys_instr
+                        )
+                    
+                    chat = model_g.start_chat(history=history)
+                    resp_g = await chat.send_message_async(current_msg["parts"][0])
+                    
+                    try:
+                        text = resp_g.text
+                    except (ValueError, IndexError):
+                        text = ""
+                        
                     tool_calls = []
-                    for b in response_a.content:
-                        if b.type == "tool_use":
-                            tool_calls.append({"id": b.id, "function": {"name": b.name, "arguments": json.dumps(b.input)}})
+                    if resp_g.candidates and resp_g.candidates[0].content.parts:
+                        for part in resp_g.candidates[0].content.parts:
+                            if part.function_call:
+                                call = part.function_call
+                                tool_calls.append({
+                                    "id": f"call_{hashlib.md5(call.name.encode()).hexdigest()[:8]}",
+                                    "function": {"name": call.name, "arguments": json.dumps(dict(call.args))}
+                                })
 
         except Exception as e:
             self.ui.print_error(f"Execution error ({provider}/{model}): {e}")

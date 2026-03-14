@@ -216,10 +216,10 @@ async def cmd_provider(cmd: str, agent: "MilexAgent") -> bool:
         print_info(f"Current provider: [bold cyan]{agent.config.get('provider', 'ollama')}[/]")
     else:
         prov = parts[1].lower()
-        if prov in ("ollama", "openai", "anthropic"):
+        if prov in ("ollama", "gemini"):
             agent.config["provider"] = prov
             save_config(agent.config)
             print_success(f"Provider set to: [bold cyan]{prov}[/]")
         else:
-            print_error("Invalid provider. Use: ollama, openai, or anthropic")
+            print_error("Invalid provider. Use: ollama or gemini")
     return True
