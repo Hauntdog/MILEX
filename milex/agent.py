@@ -15,6 +15,16 @@ from typing import Any, Callable, Dict, Generator, List, Optional, Tuple, Union
 
 import ollama
 
+try:
+    from openai import AsyncOpenAI
+except ImportError:
+    AsyncOpenAI = None
+
+try:
+    from anthropic import AsyncAnthropic
+except ImportError:
+    AsyncAnthropic = None
+
 from .config import load_config, save_config
 from .tools import TOOL_DEFINITIONS, ToolExecutor
 from .rag import RagManager
@@ -102,6 +112,10 @@ class MilexAgent:
         self._role_model_cache: Dict[str, str] = {}
         self._roles_dirty: bool = True
 
+        # Multi-provider clients
+        self._openai_client = None
+        self._anthropic_client = None
+
     def start_background_tasks(self):
         """Must be called within an event loop."""
         if not self._keepalive_task:
@@ -165,30 +179,67 @@ class MilexAgent:
         """Invalidate the role model cache after config changes."""
         self._roles_dirty = True
 
+    def _get_provider(self, model_name: str) -> str:
+        """Infer provider from model name if not explicitly set."""
+        if self.config.get("provider") != "ollama":
+            return self.config["provider"]
+            
+        name = model_name.lower()
+        if name.startswith("gpt-") or name.startswith("o1-"):
+            return "openai"
+        if name.startswith("claude-"):
+            return "anthropic"
+        return "ollama"
+
+    async def _get_client(self, provider: str):
+        """Get or initialize the appropriate provider client."""
+        if provider == "openai":
+            if not self._openai_client:
+                if not AsyncOpenAI:
+                    raise ImportError("OpenAI SDK not installed. Run 'pip install openai'")
+                key = self.config.get("openai_key")
+                if not key:
+                    raise ValueError("OpenAI API key missing. Set 'openai_key' in config.")
+                self._openai_client = AsyncOpenAI(api_key=key)
+            return self._openai_client
+        
+        if provider == "anthropic":
+            if not self._anthropic_client:
+                if not AsyncAnthropic:
+                    raise ImportError("Anthropic SDK not installed. Run 'pip install anthropic'")
+                key = self.config.get("anthropic_key")
+                if not key:
+                    raise ValueError("Anthropic API key missing. Set 'anthropic_key' in config.")
+                self._anthropic_client = AsyncAnthropic(api_key=key)
+            return self._anthropic_client
+            
+        return self._client
+
     async def _chat_safe(self, model: str, **kwargs):
-        """Async chat with fallback retry and 400 error handling."""
+        """Async chat for Ollama with fallback retry and 400 error handling."""
         try:
             return await self._client.chat(model=model, **kwargs)
         except Exception as e:
             error_msg = str(e).lower()
-            # Handle 400 Bad Request - retry with minimal options
             if "400" in error_msg or "bad request" in error_msg:
-                self.ui.print_warning(f"Request failed (400), retrying with minimal options...")
-                # Remove potentially problematic options
-                minimal_options = {
-                    "temperature": 0.7,
-                    "num_predict": 2048,
-                }
+                self.ui.print_warning("Request failed (400), likely context overflow. Retrying with pruned history...")
+                original_history = self.conversation.copy()
+                if len(self.conversation) > 5:
+                    self.conversation = [self.conversation[0]] + self.conversation[-5:]
+                
+                minimal_options = {"temperature": 0.5, "num_ctx": 2048}
                 clean_kwargs = kwargs.copy()
+                clean_kwargs["messages"] = self._build_messages()
                 if "options" in clean_kwargs:
-                    # Merge minimal options with any existing
                     clean_kwargs["options"] = {**clean_kwargs.get("options", {}), **minimal_options}
                 else:
                     clean_kwargs["options"] = minimal_options
+                    
                 try:
                     return await self._client.chat(model=model, **clean_kwargs)
                 except Exception as retry_error:
-                    self.ui.print_error(f"Retry also failed: {retry_error}")
+                    self.conversation = original_history
+                    self.ui.print_error(f"Retry failed: {retry_error}")
             
             fallback = self._get_model_for_role("fallback")
             if fallback and fallback != model:
@@ -233,6 +284,19 @@ class MilexAgent:
             return options
         except (ValueError, TypeError):
             return defaults
+
+    def _detect_streaming_loop(self, text: str, min_len: int = 40) -> bool:
+        """Heuristic to detect if the model has started repeating a significant chunk of text."""
+        if len(text) < min_len * 2:
+            return False
+            
+        # Check for immediate repetition of chunks (e.g. "abcabc")
+        for window in range(min_len, min(len(text) // 2, 256)):
+            if text[-window:] == text[-2*window:-window]:
+                return True
+                
+        # Check for phrase-level repetition (more expensive)
+        return False
 
     # ── Public API (Async) ───────────────────────────────────────────────────
 
@@ -310,35 +374,110 @@ class MilexAgent:
             spinner = self.ui.create_thinking_spinner(spinner_msg)
             spinner.start()
             try:
-                stream = await self._chat_safe(
-                    model=model,
-                    messages=messages,
-                    tools=await self.executor.get_all_tools(),
-                    stream=True,
-                    keep_alive=self.keep_alive,
-                    options=self._get_options(),
-                )
-                
                 tool_calls_dict = {}
                 with self.ui.create_stream_renderer(model=model) as renderer:
-                    async for chunk in stream:
-                        if spinner:
-                            spinner.stop()
-                            spinner = None
+                    # Detect provider for specific streaming logic
+                    provider = self._get_provider(model)
+                    
+                    if provider == "ollama":
+                        stream = await self._chat_safe(
+                            model=model,
+                            messages=messages,
+                            tools=await self.executor.get_all_tools(),
+                            stream=True,
+                            keep_alive=self.keep_alive,
+                            options=self._get_options(),
+                        )
+                        async for chunk in stream:
+                            msg = chunk.get("message", {})
+                            if msg.get("tool_calls"):
+                                for i, tc in enumerate(msg["tool_calls"]):
+                                    tc_id = getattr(tc, "id", None) or tc.get("id") or str(i)
+                                    tool_calls_dict[tc_id] = tc
+                            delta = msg.get("content", "")
+                            if delta:
+                                full_text += delta
+                                renderer.update(delta)
+                                if self._detect_streaming_loop(full_text):
+                                    self.ui.print_warning("Streaming loop detected. Breaking.")
+                                    break
+                    
+                    elif provider == "openai":
+                        o_client = await self._get_client("openai")
+                        tools = await self.executor.get_all_tools()
+                        stream = await o_client.chat.completions.create(
+                            model=model,
+                            messages=messages,
+                            tools=tools,
+                            stream=True,
+                            temperature=self.config.get("temperature", 0.4),
+                            max_tokens=self.config.get("max_tokens", 4096),
+                        )
+                        async for chunk in stream:
+                            if not chunk.choices: continue
+                            delta = chunk.choices[0].delta
+                            if delta.content:
+                                full_text += delta.content
+                                renderer.update(delta.content)
+                                if self._detect_streaming_loop(full_text):
+                                    self.ui.print_warning("Streaming loop detected. Breaking.")
+                                    break
+                            if delta.tool_calls:
+                                for tc in delta.tool_calls:
+                                    tc_id = tc.id or str(len(tool_calls_dict))
+                                    if tc_id not in tool_calls_dict:
+                                        tool_calls_dict[tc_id] = {"id": tc_id, "function": {"name": "", "arguments": ""}}
+                                    
+                                    # Collect function name if available
+                                    if hasattr(tc, 'function') and tc.function.name:
+                                        tool_calls_dict[tc_id]["function"]["name"] = tc.function.name
+                                    
+                                    # Collect arguments if available
+                                    if hasattr(tc, 'function') and tc.function.arguments:
+                                        tool_calls_dict[tc_id]["function"]["arguments"] += tc.function.arguments
+
+                    elif provider == "anthropic":
+                        client_a = await self._get_client("anthropic")
+                        tools_a = await self.executor.get_all_tools()
+                        anthropic_tools = []
+                        for t in tools_a:
+                            anthropic_tools.append({
+                                "name": t["function"]["name"],
+                                "description": t["function"]["description"],
+                                "input_schema": t["function"]["parameters"]
+                            })
                         
-                        msg = chunk.get("message", {})
+                        system_msg = next((m["content"] for m in messages if m["role"] == "system"), "")
+                        user_messages = [m for m in messages if m["role"] != "system"]
                         
-                        # Handle tool calls (deduplicate by index or ID)
-                        if msg.get("tool_calls"):
-                            for i, tc in enumerate(msg["tool_calls"]):
-                                # Use index as key if ID is missing (Ollama style)
-                                tc_id = getattr(tc, "id", None) or tc.get("id") or str(i)
-                                tool_calls_dict[tc_id] = tc
-                        
-                        delta = msg.get("content", "")
-                        if delta:
-                            full_text += delta
-                            renderer.update(delta)
+                        # Corrected Anthropic streaming pattern
+                        async with client_a.messages.stream(
+                            model=model,
+                            max_tokens=self.config.get("max_tokens", 4096),
+                            system=system_msg,
+                            messages=user_messages,
+                            tools=anthropic_tools,
+                        ) as stream_a:
+                            async for text in stream_a.text_stream:
+                                full_text += text
+                                renderer.update(text)
+                                if self._detect_streaming_loop(full_text):
+                                    self.ui.print_warning("Streaming loop detected. Breaking.")
+                                    # Interrupting a stream requires careful closing
+                                    break
+                            
+                            final_msg = await stream_a.get_final_message()
+                            for block in final_msg.content:
+                                if block.type == "tool_use":
+                                    tool_calls_dict[block.id] = {
+                                        "id": block.id,
+                                        "function": {"name": block.name, "arguments": json.dumps(block.input)}
+                                    }
+                
+                # Close renderer and proceed
+                if spinner:
+                    spinner.stop()
+                    spinner = None
                 
                 tool_calls = list(tool_calls_dict.values())
             finally:
@@ -350,10 +489,13 @@ class MilexAgent:
 
             if tool_calls:
                 await self._process_tool_calls(full_text, tool_calls)
+                # After tool calls, we might want a synthesizing response spinner
+                # but it will be handled by the next iteration of the round loop in chat/stream_chat
                 return full_text
             
             if full_text:
-                self.conversation.append({"role": "assistant", "content": full_text})
+                if not any(m.get("role") == "assistant" and m.get("content") == full_text for m in self.conversation):
+                    self.conversation.append({"role": "assistant", "content": full_text})
                 self._add_to_cache(cache_key, full_text)
                 self._extract_and_offer_code(full_text)
             
@@ -384,16 +526,21 @@ class MilexAgent:
 
         # Detect loop
         current_batch_hash = "|".join(sorted(unique_call_hashes))
-        self._last_tool_calls.append(current_batch_hash)
         
-        # If we see the same batch of tool calls multiple times, it's a loop
-        if self._last_tool_calls.count(current_batch_hash) >= self._max_repeat_threshold:
-            self.ui.print_error("Detected tool call loop. Aborting current execution.")
+        # We check the last N tool call batches for repetitions
+        # If the same batch appears multiple times in a row, it's a likely loop
+        if len(self._last_tool_calls) > 0 and self._last_tool_calls.count(current_batch_hash) >= self._max_repeat_threshold:
+            self.ui.print_error(f"Detected repetitive tool call pattern: {current_batch_hash[:50]}...")
+            self.ui.print_warning("MILEX is stopping to prevent an infinite loop.")
+            
+            loop_msg = "I've detected an infinite loop in my tool calls. I'll stop here to prevent further issues. Please try rephrasing your request."
             self.conversation.append({
                 "role": "assistant",
-                "content": "I apologize, but I've entered a repetitive loop of tool calls. I'm stopping to prevent further issues."
+                "content": loop_msg
             })
             return
+
+        self._last_tool_calls.append(current_batch_hash)
 
         self.conversation.append({
             "role": "assistant",
@@ -473,9 +620,27 @@ class MilexAgent:
             return {"error": str(e)}
 
     def _prune_history(self):
+        """Keep the conversation history within bounds, but preserve the first system message and recent context."""
         max_history = self.config.get("max_history", 25)
+        
+        # If we are in the middle of a complex tool-use round, we might want to temporarily exceed max_history
+        # to ensure the model has all the tool results it needs to finalize.
+        # But for simplicity, we just look at the total count here.
+        
         if len(self.conversation) > max_history:
-            self.conversation = [self.conversation[0]] + self.conversation[-(max_history-1):]
+            # Keep index 0 (usually system prompt or first user message)
+            # and the most recent (max_history - 1) messages
+            # We try to keep things in pairs (user/assistant or tool_call/tool_result)
+            preserved = [self.conversation[0]]
+            recent = self.conversation[-(max_history-1):]
+            
+            # If the first message in 'recent' is a tool result, we should probably keep 
+            # the preceding assistant message (which has the tool call)
+            if recent and recent[0].get("role") == "tool":
+                # Find the corresponding tool call message if possible
+                pass 
+                
+            self.conversation = preserved + recent
 
     def _add_to_cache(self, key: str, value: str):
         """Add response to cache with LRU eviction."""
@@ -493,25 +658,59 @@ class MilexAgent:
 
     async def _call_model(self, messages: List[Dict]) -> Tuple[str, List]:
         model = self._get_model_for_role("primary")
+        provider = self._get_provider(model)
+        
         try:
             spinner_msg = "Thinking..."
             if self.conversation and self.conversation[-1].get("role") == "tool":
                 spinner_msg = "Synthesizing response..."
                 
             with self.ui.create_thinking_spinner(spinner_msg):
-                response = await self._chat_safe(
-                    model=model, 
-                    messages=messages, 
-                    tools=await self.executor.get_all_tools(), 
-                    options=self._get_options()
-                )
-        except Exception as e:
-            self.ui.print_error(f"Execution error: {e}")
-            return "", []
+                if provider == "ollama":
+                    response = await self._chat_safe(
+                        model=model, 
+                        messages=messages, 
+                        tools=await self.executor.get_all_tools(), 
+                        options=self._get_options()
+                    )
+                    msg = response.message
+                    text = msg.content or ""
+                    tool_calls = msg.tool_calls or []
+                
+                elif provider == "openai":
+                    o_client_nc = await self._get_client("openai")
+                    # Ensure we have the actual client and not a coroutine
+                    o_response = await o_client_nc.chat.completions.create(
+                        model=model,
+                        messages=messages,
+                        tools=await self.executor.get_all_tools(),
+                        temperature=self.config.get("temperature", 0.4),
+                    )
+                    text = o_response.choices[0].message.content or ""
+                    tool_calls = o_response.choices[0].message.tool_calls or []
+                
+                elif provider == "anthropic":
+                    a_client = await self._get_client("anthropic")
+                    tools_a = await self.executor.get_all_tools()
+                    system_a = messages[0]["content"] if messages[0]["role"] == "system" else ""
+                    msgs_a = [m for m in messages if m["role"] != "system"]
+                    
+                    response_a = await a_client.messages.create(
+                        model=model,
+                        max_tokens=4096,
+                        system=system_a,
+                        messages=msgs_a,
+                        tools=[{"name": t["function"]["name"], "description": t["function"]["description"], "input_schema": t["function"]["parameters"]} for t in tools_a]
+                    )
+                    text = "".join(b.text for b in response_a.content if b.type == "text")
+                    tool_calls = []
+                    for b in response_a.content:
+                        if b.type == "tool_use":
+                            tool_calls.append({"id": b.id, "function": {"name": b.name, "arguments": json.dumps(b.input)}})
 
-        msg = response.message
-        text = msg.content or ""
-        tool_calls = msg.tool_calls or []
+        except Exception as e:
+            self.ui.print_error(f"Execution error ({provider}/{model}): {e}")
+            return "", []
 
         if not tool_calls and text:
             tool_calls = self._parse_inline_tool_calls(text)

@@ -423,6 +423,7 @@ command_registry.register("/code", commands.cmd_code, 2, "Generate code for a ta
 command_registry.register("/research", commands.cmd_research, 1, "Collect info on a topic and save to a txt file")
 command_registry.register("/run", commands.cmd_run, 1, "Run a shell command")
 command_registry.register("/sysinfo", commands.cmd_sysinfo, 0, "Show system information")
+command_registry.register("/provider", commands.cmd_provider, 0, "Switch AI provider (ollama, openai, anthropic)")
 command_registry.register("/telemetry", commands.cmd_telemetry, 0, "Show tool performance stats")
 
 

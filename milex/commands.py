@@ -209,3 +209,17 @@ async def cmd_telemetry(cmd: str, agent: "MilexAgent") -> bool:
         )
     console.print(table)
     return True
+async def cmd_provider(cmd: str, agent: "MilexAgent") -> bool:
+    """Handle /provider command."""
+    parts = cmd.strip().split(maxsplit=1)
+    if len(parts) < 2:
+        print_info(f"Current provider: [bold cyan]{agent.config.get('provider', 'ollama')}[/]")
+    else:
+        prov = parts[1].lower()
+        if prov in ("ollama", "openai", "anthropic"):
+            agent.config["provider"] = prov
+            save_config(agent.config)
+            print_success(f"Provider set to: [bold cyan]{prov}[/]")
+        else:
+            print_error("Invalid provider. Use: ollama, openai, or anthropic")
+    return True

@@ -20,10 +20,13 @@ DEFAULT_CONFIG = {
     },
     "ollama_host": "http://localhost:11434",
     "daemon_token": None,  # Will be generated in load_config
+    "provider": "ollama",   # Current options: ollama, openai, anthropic
+    "openai_key": None,
+    "anthropic_key": None,
     "theme": "dark",
-    "max_tokens": 2048,
-    "num_ctx": 4096,        # Maintain context for persona
-    "temperature": 0.5,     # Lower for even more stability
+    "max_tokens": 4096,     # Larger output limit
+    "num_ctx": 16384,       # Larger context for complex agentic loops
+    "temperature": 0.4,     # Lower for even more stability (less "drift")
     "auto_execute": False,
     "show_thinking": True,
     "stream": True,
@@ -32,9 +35,9 @@ DEFAULT_CONFIG = {
     "num_batch": 128,       # Much lower batch size to prevent long prefill pauses
     "num_thread": 4,        # Conservative thread count
     "num_keep": -1,         # Pin entire system prompt
-    "max_history": 8,       # Smaller history = faster inference
+    "max_history": 30,       # Increased to maintain context during tool usage
     "cache_size": 32,       # Smaller cache to save RAM
-    "repeat_penalty": 1.25, # Higher penalty for stability
+    "repeat_penalty": 1.5, # Aggressive penalty to prevent looping locally
     "allowed_root": None,
     "plugin_dir": str(CONFIG_DIR / "plugins"),
     "mcp_servers": {
@@ -50,8 +53,8 @@ DEFAULT_CONFIG = {
     "rag": {
         "enabled": True,
         "index_on_startup": False,
-        "chunk_size": 1000,
-        "chunk_overlap": 100,
+        "chunk_size": 2000,
+        "chunk_overlap": 200,
         "similarity_threshold": 0.3, # Cosine similarity threshold for RAG results
         "exclude_dirs": [".git", "__pycache__", ".venv", "node_modules", "dist", "build"]
     },

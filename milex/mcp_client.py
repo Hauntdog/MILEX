@@ -21,6 +21,7 @@ class MCPClientManager:
         self.config = config
         self.servers = config.get("mcp_servers", {})
         self.sessions: Dict[str, ClientSession] = {}
+        self._tool_cache: Dict[str, List[Dict[str, Any]]] = {}
         self._exit_stacks = []
         self._tasks = []
 
@@ -52,21 +53,31 @@ class MCPClientManager:
                     self.sessions[name] = session
                     print_info(f"Connected to MCP Server: [bold cyan]{name}[/]")
                     
+                    # Clear cache on new connection
+                    self._tool_cache.pop(name, None)
+                    
                     # Keep session alive and process notifications
                     while True:
                         await asyncio.sleep(1)
         except Exception as e:
             print_error(f"Failed to connect to MCP Server '{name}': {e}")
+            self.sessions.pop(name, None)
 
     async def get_all_tools(self) -> List[Dict[str, Any]]:
-        """Fetch tool definitions from all connected MCP servers."""
+        """Fetch tool definitions from all connected MCP servers with caching."""
         all_tools = []
         for name, session in self.sessions.items():
+            # Return cached tools if available
+            if name in self._tool_cache:
+                all_tools.extend(self._tool_cache[name])
+                continue
+                
             try:
                 tools_result = await session.list_tools()
+                server_tools = []
                 for tool in tools_result.tools:
                     # Convert MCP tools to OpenAI/Ollama tool format
-                    all_tools.append({
+                    server_tools.append({
                         "type": "function",
                         "function": {
                             "name": f"{name}__{tool.name}",
@@ -76,6 +87,8 @@ class MCPClientManager:
                         "mcp_server": name,
                         "raw_name": tool.name
                     })
+                self._tool_cache[name] = server_tools
+                all_tools.extend(server_tools)
             except Exception as e:
                 print_warning(f"Could not list tools from MCP server '{name}': {e}")
         return all_tools
