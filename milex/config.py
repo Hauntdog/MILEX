@@ -13,7 +13,6 @@ HISTORY_FILE = CONFIG_DIR / "history.json"
 DEFAULT_CONFIG = {
     "model": "qwen2.5:1.5b",
     "roles": {
-        "primary": "qwen2.5:1.5b",
         "coder": "qwen2.5:1.5b", # Use faster model by default for code tasks
         "embeddings": "nomic-embed-text:latest",
         "fallback": "qwen2.5:1.5b"

@@ -218,6 +218,16 @@ async def cmd_provider(cmd: str, agent: "MilexAgent") -> bool:
         prov = parts[1].lower()
         if prov in ("ollama", "gemini"):
             agent.config["provider"] = prov
+            
+            # Proactive model switching
+            current_model = agent.config.get("model", "")
+            if prov == "gemini" and not current_model.startswith("gemini-"):
+                agent.config["model"] = "gemini-1.5-flash"
+                print_info("Provider set to gemini. Switched to default model: [bold cyan]gemini-1.5-flash[/]")
+            elif prov == "ollama" and current_model.startswith("gemini-"):
+                agent.config["model"] = "qwen2.5:1.5b"
+                print_info("Provider set to ollama. Switched to default model: [bold cyan]qwen2.5:1.5b[/]")
+            
             save_config(agent.config)
             print_success(f"Provider set to: [bold cyan]{prov}[/]")
         else:

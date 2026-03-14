@@ -17,6 +17,9 @@ import ollama
 
 try:
     import google.generativeai as genai
+    import warnings
+    # Suppress the deprecation warning from the old Gemini SDK
+    warnings.filterwarnings("ignore", category=FutureWarning, module="google.generativeai")
 except ImportError:
     genai = None
 
@@ -130,10 +133,16 @@ class MilexAgent:
 
     async def _validate_model(self):
         """Async validation."""
+        model = self.config.get("model")
+        if not model: return
+        
+        provider = self._get_provider(model)
+        if provider != "ollama":
+            return
+            
         try:
             response = await self._client.list()
             available = [m.model for m in response.models]
-            model = self.config["model"]
             if model not in available:
                 self.ui.print_warning(f"Model '{model}' not found in Ollama.")
         except Exception as e:
@@ -148,6 +157,9 @@ class MilexAgent:
 
             for model in unique_models:
                 if not model: continue
+                provider = self._get_provider(model)
+                if provider != "ollama":
+                    continue
                 try:
                     await self._client.chat(
                         model=model,
@@ -174,14 +186,65 @@ class MilexAgent:
         self._roles_dirty = True
 
     def _get_provider(self, model_name: str) -> str:
-        """Infer provider from model name if not explicitly set."""
-        if self.config.get("provider") != "ollama":
-            return self.config["provider"]
-            
+        """Infer provider from model name, falling back to global config."""
         name = model_name.lower()
         if name.startswith("gemini-"):
             return "gemini"
-        return "ollama"
+            
+        # If it looks like an Ollama model (has a colon or starts with known Ollama families), 
+        # use Ollama regardless of global provider. This enables hybrid usage.
+        if ":" in name or any(name.startswith(p) for p in ["llama", "qwen", "mistral", "phi", "codellama", "deepseek"]):
+            return "ollama"
+
+        # Fallback to global config
+        return self.config.get("provider", "ollama")
+
+    def _clean_gemini_schema(self, schema: Dict[str, Any]) -> Dict[str, Any]:
+        """Strip fields that Gemini's SDK/API doesn't support in tool definitions."""
+        if not isinstance(schema, dict):
+            return schema
+            
+        # Allowed keys for a Gemini Schema object per official API docs
+        # Note: 'format' is supported for string types (e.g. 'date-time')
+        ALLOWED_KEYS = {"type", "format", "description", "nullable", "enum", "properties", "required", "items"}
+        
+        cleaned = {}
+        for k, v in schema.items():
+            if k not in ALLOWED_KEYS:
+                continue
+            
+            if k == "properties" and isinstance(v, dict):
+                cleaned[k] = {pk: self._clean_gemini_schema(pv) for pk, pv in v.items()}
+            elif k == "items" and isinstance(v, dict):
+                cleaned[k] = self._clean_gemini_schema(v)
+            elif k == "required" and isinstance(v, list):
+                if v: # Only add if non-empty
+                    cleaned[k] = v
+            elif isinstance(v, list):
+                cleaned[k] = [self._clean_gemini_schema(i) if isinstance(i, dict) else i for i in v]
+            else:
+                cleaned[k] = v
+        
+        # Ensure 'type' is present - Gemini is very strict
+        if "type" not in cleaned:
+            if "properties" in cleaned:
+                cleaned["type"] = "object"
+            elif "items" in cleaned:
+                cleaned["type"] = "array"
+            else:
+                cleaned["type"] = "string" # Safest default
+        
+        # Handle list-based types (e.g. ["string", "null"])
+        if isinstance(cleaned.get("type"), list):
+            types = cleaned["type"]
+            if "null" in types:
+                cleaned["nullable"] = True
+                remaining = [t for t in types if t != "null"]
+                cleaned["type"] = remaining[0] if remaining else "string"
+            else:
+                cleaned["type"] = types[0]
+
+        return cleaned
 
     async def _get_client(self, provider: str):
         """Get or initialize the appropriate provider client."""
@@ -395,7 +458,15 @@ class MilexAgent:
                         tools_g = await self.executor.get_all_tools()
                         gemini_tools = []
                         if tools_g:
-                            gemini_tools = [{"function_declarations": [t["function"] for t in tools_g]}]
+                            functions = []
+                            for t in tools_g:
+                                f_decl = {
+                                    "name": t["function"]["name"],
+                                    "description": t["function"]["description"],
+                                    "parameters": self._clean_gemini_schema(t["function"]["parameters"])
+                                }
+                                functions.append(f_decl)
+                            gemini_tools = [{"function_declarations": functions}]
                         
                         sys_instr = next((m["content"] for m in messages if m["role"] == "system"), None)
                         model_g = g_client.GenerativeModel(
@@ -413,7 +484,7 @@ class MilexAgent:
                             history.append({"role": role, "parts": [content]})
                         
                         current_msg = history.pop() if history else {"role": "user", "parts": [""]}
-                        chat = model_g.start_chat(history=history or None)
+                        chat = model_g.start_chat(history=history if history else None)
                         
                         response_stream = await chat.send_message_async(current_msg["parts"][0], stream=True)
                         async for chunk in response_stream:
@@ -656,7 +727,15 @@ class MilexAgent:
                     tools_g = await self.executor.get_all_tools()
                     gemini_tools = []
                     if tools_g:
-                        gemini_tools = [{"function_declarations": [t["function"] for t in tools_g]}]
+                        functions = []
+                        for t in tools_g:
+                            f_decl = {
+                                "name": t["function"]["name"],
+                                "description": t["function"]["description"],
+                                "parameters": self._clean_gemini_schema(t["function"]["parameters"])
+                            }
+                            functions.append(f_decl)
+                        gemini_tools = [{"function_declarations": functions}]
                     
                     model_g = g_client.GenerativeModel(
                         model_name=model,
@@ -684,7 +763,7 @@ class MilexAgent:
                             system_instruction=sys_instr
                         )
                     
-                    chat = model_g.start_chat(history=history)
+                    chat = model_g.start_chat(history=history if history else None)
                     resp_g = await chat.send_message_async(current_msg["parts"][0])
                     
                     try:
