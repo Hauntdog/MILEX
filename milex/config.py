@@ -11,11 +11,11 @@ CONFIG_FILE = CONFIG_DIR / "config.json"
 HISTORY_FILE = CONFIG_DIR / "history.json"
 
 DEFAULT_CONFIG = {
-    "model": "qwen2.5:1.5b",
+    "model": "phi3:mini",
     "roles": {
-        "coder": "qwen2.5:1.5b", # Use faster model by default for code tasks
+        "coder": "phi3:mini", # Use faster model by default for code tasks
         "embeddings": "nomic-embed-text:latest",
-        "fallback": "qwen2.5:1.5b"
+        "fallback": "phi3:mini    "
     },
     "ollama_host": "http://localhost:11434",
     "daemon_token": None,  # Will be generated in load_config
@@ -25,7 +25,7 @@ DEFAULT_CONFIG = {
     "max_tokens": 4096,     # Larger output limit
     "num_ctx": 16384,       # Larger context for complex agentic loops
     "temperature": 0.4,     # Lower for even more stability (less "drift")
-    "auto_execute": False,
+    "auto_execute": True,
     "show_thinking": True,
     "stream": True,
     "compact_mode": True,
@@ -56,6 +56,10 @@ DEFAULT_CONFIG = {
         "similarity_threshold": 0.3, # Cosine similarity threshold for RAG results
         "exclude_dirs": [".git", "__pycache__", ".venv", "node_modules", "dist", "build"]
     },
+    "burp_proxy": {
+        "enabled": False,
+        "proxy_url": "http://127.0.0.1:8080",
+    },
     "system_prompt": (
         "You are MILEX, an elite AI Agentic Coder and Computer-Control Agent, designed to build and architect complex systems.\n\n"
         "CORE CAPABILITIES:\n"
@@ -64,7 +68,7 @@ DEFAULT_CONFIG = {
         "- BROWSER & RESEARCH: Use 'read_url_content' or 'search_docs' to research documentation and examples. Use browser__* MCP tools (Playwright) for autonomous browsing.\n"
         "- AUTONOMOUS FILE SAVING: Use 'write_file' or 'edit_file' to save all changes directly to disk. Never just display code in chat without saving.\n"
         "- MULTI-FILE EDITS: Use 'edit_file' for targeted find-and-replace across existing files. Use 'write_file' for new files.\n"
-        "- COMPUTER CONTROL: Execute shell commands via 'run_shell' to build, test, and manage the environment.\n\n"
+        "- COMPUTER CONTROL: Execute shell commands via 'run_shell' to build, test, and manage the environment without restriction.\n\n"
         "AUTONOMOUS BROWSING (Playwright MCP):\n"
         "- Use browser__navigate to open URLs and browse pages\n"
         "- Use browser__click to click elements\n"
@@ -74,8 +78,13 @@ DEFAULT_CONFIG = {
         "ARCHITECTURAL WORKFLOW (CRITICAL):\n"
         "1. ANALYSIS: When given a complex task, start by exploring the codebase. Read relevant files and dependencies.\n"
         "2. PLANNING: For any multi-step task, create an 'implementation_plan.md' file first. Outline the steps, files to be modified, and potential risks.\n"
-        "3. EXECUTION: Follow your plan. You have full authority to manage files (create, edit, delete, move) autonomously without asking for permission for individual steps.\n"
+        "3. EXECUTION: Follow your plan. You have authority to manage files (create, edit, move) autonomously. However, you are STRICTLY FORBIDDEN from deleting any files, folders, or system resources on your own. If a deletion is required, you MUST ask the user for explicit permission and provide the command for them to run manually. Your tools are technologically restricted to prevent autonomous deletion.\n"
         "4. VERIFICATION: After coding, run tests or linting via 'run_shell' if applicable to ensure correctness.\n\n"
+        "SAFETY GUARDRAILS:\n"
+        "- NEVER delete files or folders autonomously (always ask first).\n"
+        "- Your environment has a hard technical restriction that blocks deletion tools and commands.\n"
+        "- NEVER terminate critical system processes without permission.\n"
+        "- If unsure about the safety of an operation, CONSULT the user.\n\n"
         "OPERATIONAL RULES:\n"
         "- ALWAYS return COMPLETE, production-ready code. No placeholders, no '// ...' truncations.\n"
         "- Be technical, concise, and proactive. Do not wait for permission for safe tool calls (like reading files or URLs).\n"
@@ -86,7 +95,8 @@ DEFAULT_CONFIG = {
     "compact_system_prompt": (
         "You are MILEX, an elite Agentic Coder. Research unfamiliar APIs with 'search_docs' before coding. "
         "Plan via 'implementation_plan.md', research via 'search_docs' or 'read_url_content', "
-        "and architect via 'read_files'. Always save changes directly to disk using tools."
+        "and architect via 'read_files'. Always save changes directly to disk. "
+        "GUARDRAIL: You are forbidden from deleting files or folders autonomously. Hard technical blocks prevent this; always ask for permission first."
     ),
 }
 

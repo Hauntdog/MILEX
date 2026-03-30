@@ -3,6 +3,7 @@ import asyncio
 import importlib.util
 import os
 import platform
+import re
 import shlex
 import shutil
 import subprocess
@@ -24,9 +25,9 @@ else:
 MAX_READ_BYTES = 1 * 1024 * 1024  # 1 MB
 
 # Set of dangerous tool names that require confirmation
-DANGEROUS_TOOLS = frozenset({
-    "run_shell",
-})
+DANGEROUS_TOOLS = frozenset({"delete_path", "kill_process", "system_control", "run_shell"})
+# Tools that MUST ALWAYS be confirmed, even if auto_execute is True (Safety Guardrail)
+MANDATORY_CONFIRM_TOOLS = frozenset({"delete_path", "system_control"})
 
 
 def _validate_path(path_str: str, config: dict, must_exist: bool = False) -> Path:
@@ -240,24 +241,6 @@ TOOL_DEFINITIONS = [
     {
         "type": "function",
         "function": {
-            "name": "delete_path",
-            "description": "Delete a file or directory.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "path": {"type": "string", "description": "Path to delete"},
-                    "recursive": {
-                        "type": "boolean",
-                        "description": "Delete directory recursively",
-                    },
-                },
-                "required": ["path"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
             "name": "copy_path",
             "description": "Copy a file or directory.",
             "parameters": {
@@ -427,6 +410,112 @@ TOOL_DEFINITIONS = [
             },
         },
     },
+    # === Computer Control Tools ===
+    {
+        "type": "function",
+        "function": {
+            "name": "list_processes",
+            "description": "List running processes on the system with optional filtering.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "search": {
+                        "type": "string",
+                        "description": "Optional: filter processes by name"
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Maximum number of processes to return (default: 20)"
+                    }
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "kill_process",
+            "description": "Terminate a process by its PID.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "pid": {
+                        "type": "integer",
+                        "description": "Process ID to terminate"
+                    },
+                    "force": {
+                        "type": "boolean",
+                        "description": "Force kill (SIGKILL) instead of graceful (SIGTERM)"
+                    }
+                },
+                "required": ["pid"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_network_info",
+            "description": "Get network configuration and connectivity status.",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "take_screenshot",
+            "description": "Take a screenshot of the current screen and save it to a file.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Path to save the screenshot (default: screenshot.png in current directory)"
+                    }
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "system_control",
+            "description": "Control system power actions (shutdown, restart, sleep, lock).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["shutdown", "restart", "sleep", "lock", "logout"],
+                        "description": "The system action to perform"
+                    },
+                    "delay": {
+                        "type": "integer",
+                        "description": "Delay in seconds before executing (default: 0)"
+                    }
+                },
+                "required": ["action"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_clipboard",
+            "description": "Read text from the system clipboard.",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "required": [],
+            },
+        },
+    },
 ]
 
 
@@ -450,7 +539,19 @@ class ToolExecutor:
         self.agent = agent
         self.auto_execute = auto_execute
         self.plugins: Dict[str, Callable] = {}
+        self._tool_cache: List[Dict[str, Any]] = []
+        self._cache_expiry: float = 0
         self._load_plugins()
+
+    def _get_request_kwargs(self) -> Dict[str, Any]:
+        """Helper to inject proxy settings into requests if Burp is enabled."""
+        kwargs = {"timeout": 15}
+        proxy_cfg = self.config.get("burp_proxy", {})
+        if proxy_cfg.get("enabled"):
+            proxy_url = proxy_cfg.get("proxy_url", "http://127.0.0.1:8080")
+            kwargs["proxies"] = {"http": proxy_url, "https": proxy_url}
+            kwargs["verify"] = False # Burp usually uses a self-signed cert
+        return kwargs
 
     def _load_plugins(self):
         """Dynamic plugin discovery."""
@@ -486,12 +587,21 @@ class ToolExecutor:
         success = True
         error = None
         
+        # HARD GUARDRAIL: Block deletion tools (including MCP tools)
+        name_lower = tool_name.lower()
+        if any(kw in name_lower for kw in ("delete", "remove", "unlink", "rmdir")):
+            return {"error": "Security Guardrail: MILEX is forbidden from deleting files or folders autonomously."}
+
         try:
             # Handle MCP Tools (prefixed with server_name__)
             if "__" in tool_name and self.agent and hasattr(self.agent, "mcp"):
                 parts = tool_name.split("__", 1)
                 server_name, raw_tool_name = parts[0], parts[1]
                 
+                # Check raw tool name for deletion keywords too
+                if any(kw in raw_tool_name.lower() for kw in ("delete", "remove", "unlink", "rmdir")):
+                    return {"error": "Security Guardrail: MILEX is forbidden from deleting files or folders autonomously."}
+
                 # MCP calls are always async
                 try:
                     mcp_res = await self.agent.mcp.call_tool(server_name, raw_tool_name, args)
@@ -515,7 +625,14 @@ class ToolExecutor:
             telemetry.record(tool_name, time.time() - start_time, success, error)
 
     async def get_all_tools(self) -> List[Dict[str, Any]]:
-        """Fetch all available tools (internal + plugins + MCP)."""
+        """Fetch all available tools (internal + plugins + MCP) with intelligent caching."""
+        import time
+        now = time.time()
+        
+        # Cache for 10 seconds to avoid repeated calls during a single turn
+        if self._tool_cache and now < self._cache_expiry:
+            return self._tool_cache
+
         tools = TOOL_DEFINITIONS.copy()
         
         # Add MCP tools if agent and MCP are available
@@ -523,6 +640,8 @@ class ToolExecutor:
             mcp_tools = await self.agent.mcp.get_all_tools()
             tools.extend(mcp_tools)
             
+        self._tool_cache = tools
+        self._cache_expiry = now + 10.0 # 10s cache
         return tools
 
     def execute(self, tool_name: str, args: Dict[str, Any]) -> Dict[str, Any]:
@@ -548,6 +667,13 @@ class ToolExecutor:
             "read_url_content": self._read_url_content,
             "read_files": self._read_files,
             "search_web": self._search_web,
+            # Computer control tools
+            "list_processes": self._list_processes,
+            "kill_process": self._kill_process,
+            "get_network_info": self._get_network_info,
+            "take_screenshot": self._take_screenshot,
+            "system_control": self._system_control,
+            "get_clipboard": self._get_clipboard,
         }
 
         # Merge with plugins
@@ -564,7 +690,12 @@ class ToolExecutor:
         # can save files on its own without prompting every time.
         is_plugin = tool_name in self.plugins
 
-        if (tool_name in DANGEROUS_TOOLS or is_plugin) and not self.auto_execute:
+        # Destructive tools need confirmation.
+        # MANDATORY_CONFIRM_TOOLS always prompt, even in auto_execute mode.
+        needs_confirm = (tool_name in DANGEROUS_TOOLS or is_plugin) and not self.auto_execute
+        is_mandatory = tool_name in MANDATORY_CONFIRM_TOOLS
+
+        if (needs_confirm or is_mandatory):
             if self.ui and not self.ui.confirm_tool(tool_name, args):
                 return {"status": "cancelled", "message": "User cancelled execution"}
 
@@ -580,6 +711,16 @@ class ToolExecutor:
     def _run_shell(
         self, command: str, cwd: Optional[str] = None, timeout: int = 30
     ) -> dict:
+        # HARD GUARDRAIL: Block common deletion commands in shell
+        cmd_lower = command.lower().strip()
+        blocked_keywords = ["rm ", "rmdir ", "unlink ", "del ", "erase ", "shred "]
+        
+        # Check for direct command start or piped commands
+        if any(cmd_lower.startswith(bk) or f"| {bk}" in cmd_lower or f"& {bk}" in cmd_lower or f"; {bk}" in cmd_lower for bk in blocked_keywords):
+             # Double check with word boundaries to avoid false positives like 'orm'
+             if re.search(r'\b(rm|rmdir|unlink|del|erase|shred)\b', cmd_lower):
+                 return {"error": "Security Guardrail: Shell-based deletion is forbidden for MILEX. Ask the user to run this manually if deletion is required."}
+
         try:
             if cwd:
                 _validate_path(cwd, self.config, must_exist=True)
@@ -869,7 +1010,8 @@ class ToolExecutor:
             from markdownify import markdownify as md
 
             headers = {"User-Agent": "Mozilla/5.0 (MILEX Bot)"}
-            resp = requests.get(url, headers=headers, timeout=15)
+            kwargs = self._get_request_kwargs()
+            resp = requests.get(url, headers=headers, **kwargs)
             resp.raise_for_status()
             
             soup = BeautifulSoup(resp.text, "html.parser")
@@ -912,11 +1054,12 @@ class ToolExecutor:
             }
             data = {"q": query}
             
+            kwargs = self._get_request_kwargs()
             if self.ui:
                 with self.ui.create_thinking_spinner(f"Searching web for '{query}'..."):
-                    resp = requests.post("https://lite.duckduckgo.com/lite/", headers=headers, data=data, timeout=10)
+                    resp = requests.post("https://lite.duckduckgo.com/lite/", headers=headers, data=data, **kwargs)
             else:
-                resp = requests.post("https://lite.duckduckgo.com/lite/", headers=headers, data=data, timeout=10)
+                resp = requests.post("https://lite.duckduckgo.com/lite/", headers=headers, data=data, **kwargs)
                 
             resp.raise_for_status()
             soup = BeautifulSoup(resp.text, "html.parser")
@@ -963,3 +1106,219 @@ class ToolExecutor:
             return {"results": results}
         except Exception as e:
             return {"error": f"Failed to search web: {str(e)}"}
+
+    # === Computer Control Handlers ===
+    
+    def _list_processes(self, search: Optional[str] = None, limit: int = 20) -> dict:
+        """List running processes on the system."""
+        try:
+            import psutil
+            processes = []
+            for proc in psutil.process_iter(['pid', 'name', 'cpu_percent', 'memory_percent', 'status']):
+                try:
+                    info = proc.info
+                    if search and search.lower() not in info['name'].lower():
+                        continue
+                    processes.append({
+                        'pid': info['pid'],
+                        'name': info['name'],
+                        'cpu': info.get('cpu_percent', 0),
+                        'memory': round(info.get('memory_percent', 0), 2),
+                        'status': info.get('status', 'unknown'),
+                    })
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    continue
+            # Sort by CPU usage
+            processes.sort(key=lambda x: x['cpu'], reverse=True)
+            return {"processes": processes[:limit], "count": len(processes[:limit])}
+        except ImportError:
+            # Fallback to shell command
+            cmd = "ps aux" if not search else f"ps aux | grep -i {search}"
+            result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=10)
+            return {"output": result.stdout[:5000], "error": result.stderr}
+
+    def _kill_process(self, pid: int, force: bool = False) -> dict:
+        """Terminate a process by PID."""
+        try:
+            import psutil
+            proc = psutil.Process(pid)
+            if force:
+                proc.kill()
+            else:
+                proc.terminate()
+            return {"success": True, "message": f"Process {pid} terminated"}
+        except psutil.NoSuchProcess:
+            return {"error": f"Process {pid} not found"}
+        except psutil.AccessDenied:
+            return {"error": f"Access denied to process {pid}"}
+        except Exception as e:
+            return {"error": str(e)}
+
+    def _get_network_info(self) -> dict:
+        """Get network configuration and connectivity status."""
+        try:
+            import psutil
+            import socket
+            
+            # Get network interfaces
+            interfaces = {}
+            for iface, addrs in psutil.net_if_addrs().items():
+                iface_info = []
+                for addr in addrs:
+                    iface_info.append({
+                        "family": str(addr.family),
+                        "address": addr.address,
+                        "netmask": getattr(addr, 'netmask', None),
+                    })
+                interfaces[iface] = iface_info
+            
+            # Get network stats
+            stats = psutil.net_io_counters(pernic=True)
+            stats_dict = {}
+            for iface, stat in stats.items():
+                stats_dict[iface] = {
+                    "bytes_sent": stat.bytes_sent,
+                    "bytes_recv": stat.bytes_recv,
+                    "packets_sent": stat.packets_sent,
+                    "packets_recv": stat.packets_recv,
+                }
+            
+            # Check internet connectivity
+            has_internet = False
+            try:
+                socket.create_connection(("8.8.8.8", 53), timeout=3)
+                has_internet = True
+            except OSError:
+                pass
+            
+            return {
+                "interfaces": interfaces,
+                "stats": stats_dict,
+                "has_internet": has_internet,
+                "hostname": socket.gethostname(),
+            }
+        except ImportError:
+            # Fallback to shell commands
+            result = subprocess.run("ip addr && ip route", shell=True, capture_output=True, text=True, timeout=10)
+            return {"output": result.stdout[:5000], "error": result.stderr}
+
+    def _take_screenshot(self, path: Optional[str] = None) -> dict:
+        """Take a screenshot of the current screen."""
+        import sys
+        
+        if path is None:
+            path = "screenshot.png"
+        
+        # Try different screenshot methods
+        try:
+            # Try mss (cross-platform)
+            import mss
+            with mss.mss() as sct:
+                sct.shot(output=path)
+            return {"success": True, "path": path}
+        except ImportError:
+            pass
+        
+        try:
+            # Try PIL/Pillow
+            from PIL import ImageGrab
+            img = ImageGrab.grab()
+            img.save(path)
+            return {"success": True, "path": path}
+        except ImportError:
+            pass
+        
+        # Try platform-specific
+        system = platform.system()
+        if system == "Linux":
+            # Try gnome-screenshot, scrot, or import from imagemagick
+            for cmd in ["gnome-screenshot -f", "scrot", "import -window root"]:
+                result = subprocess.run(f"{cmd} {path}", shell=True, capture_output=True, text=True, timeout=10)
+                if result.returncode == 0 and Path(path).exists():
+                    return {"success": True, "path": path}
+        elif system == "Darwin":
+            result = subprocess.run(f"screencapture {path}", shell=True, capture_output=True, text=True, timeout=10)
+            if result.returncode == 0 and Path(path).exists():
+                return {"success": True, "path": path}
+        elif system == "Windows":
+            result = subprocess.run(f"powershell -c Add-Type -AssemblyName System.Windows.Forms; [System.Windows.Forms.Screen]::PrimaryScreen.Bitmap.Save('{path}')", shell=True, capture_output=True, text=True, timeout=10)
+            if result.returncode == 0 and Path(path).exists():
+                return {"success": True, "path": path}
+        
+        return {"error": "No screenshot tool available. Install mss or PIL (Pillow) package."}
+
+    def _system_control(self, action: str, delay: int = 0) -> dict:
+        """Control system power actions."""
+        import warnings
+        warnings.filterwarnings("ignore")
+        
+        system = platform.system()
+        cmd = None
+        
+        if action == "shutdown":
+            if system == "Linux":
+                cmd = f"shutdown -h +{delay}" if delay > 0 else "shutdown -h now"
+            elif system == "Darwin":
+                cmd = f"shutdown -h +{delay}" if delay > 0 else "shutdown -h now"
+            elif system == "Windows":
+                cmd = f"shutdown /s /t {delay}" if delay > 0 else "shutdown /s /t 0"
+        elif action == "restart":
+            if system == "Linux":
+                cmd = f"shutdown -r +{delay}" if delay > 0 else "shutdown -r now"
+            elif system == "Darwin":
+                cmd = f"shutdown -r +{delay}" if delay > 0 else "shutdown -r now"
+            elif system == "Windows":
+                cmd = f"shutdown /r /t {delay}" if delay > 0 else "shutdown /r /t 0"
+        elif action == "sleep":
+            if system == "Linux":
+                cmd = "systemctl suspend"
+            elif system == "Darwin":
+                cmd = "pmsleep now"
+            elif system == "Windows":
+                cmd = "rundll32.exe powrprof.dll,SetSuspendState 0,1,0"
+        elif action == "lock":
+            if system == "Linux":
+                cmd = "loginctl lock-session"
+            elif system == "Darwin":
+                cmd = "/System/Library/CoreServices/Menu Extras/User.menu/Contents/Resources/CGSession -suspend"
+            elif system == "Windows":
+                cmd = "rundll32.exe user32.dll,LockWorkStation"
+        elif action == "logout":
+            if system == "Linux":
+                cmd = "loginctl terminate-user $USER"
+            elif system == "Darwin":
+                cmd = "osascript -e 'tell app \"System Events\" to log out'"
+            elif system == "Windows":
+                cmd = "shutdown /l"
+        
+        if not cmd:
+            return {"error": f"Action '{action}' not supported on {system}"}
+        
+        try:
+            subprocess.Popen(cmd, shell=True)
+            return {"success": True, "message": f"System {action} scheduled"}
+        except Exception as e:
+            return {"error": str(e)}
+
+    def _get_clipboard(self) -> dict:
+        """Read text from the system clipboard."""
+        try:
+            import pyperclip
+            text = pyperclip.paste()
+            return {"text": text, "length": len(text)}
+        except ImportError:
+            # Try platform-specific methods
+            system = platform.system()
+            if system == "Linux":
+                result = subprocess.run("xclip -selection clipboard -o", shell=True, capture_output=True, text=True, timeout=5)
+                if result.returncode == 0:
+                    return {"text": result.stdout, "length": len(result.stdout)}
+            elif system == "Darwin":
+                result = subprocess.run("pbpaste", shell=True, capture_output=True, text=True, timeout=5)
+                if result.returncode == 0:
+                    return {"text": result.stdout, "length": len(result.stdout)}
+            elif system == "Windows":
+                result = subprocess.run("powershell -c Get-Clipboard", shell=True, capture_output=True, text=True, timeout=5)
+                if result.returncode == 0:
+                    return {"text": result.stdout, "length": len(result.stdout)}
+            return {"error": "No clipboard access available. Install pyperclip package."}

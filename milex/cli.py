@@ -425,6 +425,7 @@ command_registry.register("/run", commands.cmd_run, 1, "Run a shell command")
 command_registry.register("/sysinfo", commands.cmd_sysinfo, 0, "Show system information")
 command_registry.register("/provider", commands.cmd_provider, 0, "Switch AI provider (ollama, openai, anthropic)")
 command_registry.register("/telemetry", commands.cmd_telemetry, 0, "Show tool performance stats")
+command_registry.register("/burp", commands.cmd_burp, 0, "Configure Burp Suite proxy (on/off/URL)")
 
 
 async def handle_slash_command(cmd: str, agent: MilexAgent) -> bool:
@@ -543,6 +544,15 @@ def main_entry(
 ):
     """MILEX - AI-powered CLI using Ollama."""
     if ctx.invoked_subcommand: return
+    
+    # If a subcommand like 'status' or 'config' is invoked, Typer's Argument greedy matching
+    # might swallow it into 'prompt' when invoke_without_command=True. 
+    # We check if prompt matches any registered subcommand.
+    if prompt:
+        subcommands = {cmd.name for cmd in app.registered_commands}
+        if prompt in subcommands:
+            return
+
     asyncio.run(_async_main(prompt, model, auto, background, no_daemon))
 
 

@@ -233,3 +233,37 @@ async def cmd_provider(cmd: str, agent: "MilexAgent") -> bool:
         else:
             print_error("Invalid provider. Use: ollama or gemini")
     return True
+
+async def cmd_burp(cmd: str, agent: "MilexAgent") -> bool:
+    """Handle /burp command."""
+    parts = cmd.strip().split()
+    proxy_cfg = agent.config.get("burp_proxy", {"enabled": False, "proxy_url": "http://127.0.0.1:8080"})
+    
+    if len(parts) == 1:
+        # Toggle
+        proxy_cfg["enabled"] = not proxy_cfg.get("enabled", False)
+    else:
+        # Set specific status or URL
+        sub = parts[1].lower()
+        if sub in ("on", "true", "enabled"):
+            proxy_cfg["enabled"] = True
+            if len(parts) > 2:
+                proxy_cfg["proxy_url"] = parts[2]
+        elif sub in ("off", "false", "disabled"):
+            proxy_cfg["enabled"] = False
+        else:
+            # Assume it's a URL
+            proxy_cfg["enabled"] = True
+            proxy_cfg["proxy_url"] = parts[1]
+            
+    agent.config["burp_proxy"] = proxy_cfg
+    save_config(agent.config)
+    
+    status = "[green]ENABLED[/]" if proxy_cfg["enabled"] else "[red]DISABLED[/]"
+    url = proxy_cfg.get("proxy_url", "http://127.0.0.1:8080")
+    print_success(f"Burp Suite Proxy: {status}")
+    if proxy_cfg["enabled"]:
+        print_info(f"Proxy URL: [cyan]{url}[/]")
+        print_warning("Note: You may need to restart MILEX for Ollama/Gemini connection changes to take effect.")
+    
+    return True

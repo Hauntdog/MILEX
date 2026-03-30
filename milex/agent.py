@@ -12,6 +12,7 @@ from collections import OrderedDict
 from dataclasses import dataclass, field
 from functools import lru_cache
 from typing import Any, Callable, Dict, Generator, List, Optional, Tuple, Union
+import httpx
 
 import ollama
 
@@ -23,7 +24,7 @@ try:
 except ImportError:
     genai = None
 
-from .config import load_config, save_config
+from .config import DEFAULT_CONFIG, load_config, save_config
 from .tools import TOOL_DEFINITIONS, ToolExecutor
 from .rag import RagManager
 from .mcp_client import MCPClientManager
@@ -92,7 +93,30 @@ class MilexAgent:
             agent=self,
             auto_execute=self.config.get("auto_execute", False),
         )
-        self._client = ollama.AsyncClient(host=self.config["ollama_host"])
+        
+        # Configure proxy for Ollama
+        client_kwargs = {"host": self.config["ollama_host"]}
+        proxy_cfg = self.config.get("burp_proxy", {})
+        if proxy_cfg.get("enabled"):
+            proxy_url = proxy_cfg.get("proxy_url", "http://127.0.0.1:8080")
+            # Create a custom httpx client with proxy
+            self.ui.print_info(f"Burp Suite proxy enabled: [cyan]{proxy_url}[/]")
+            # ollama.AsyncClient uses httpx.AsyncClient internally. 
+            # We can pass a custom client if needed, but the library also honors HTTP_PROXY environment variables.
+            # For more control, we'll manually set the proxy in the httpx client.
+            transport = httpx.AsyncHTTPTransport(proxy=proxy_url, verify=False)
+            async_client = httpx.AsyncClient(transport=transport, timeout=httpx.Timeout(120.0))
+            self._client = ollama.AsyncClient(host=self.config["ollama_host"], client=async_client)
+            
+            # Set environment variables for other libraries (like Gemini SDK)
+            os.environ["HTTP_PROXY"] = proxy_url
+            os.environ["HTTPS_PROXY"] = proxy_url
+            # Disable SSL verification for requests/httpx via environment if possible 
+            # (though we handled it explicitly where we could)
+            os.environ["CURL_CA_BUNDLE"] = "" 
+        else:
+            self._client = ollama.AsyncClient(host=self.config["ollama_host"])
+            
         self.keep_alive = self.config.get("keep_alive", "30m")
 
         # Optimized response cache using LRU-style OrderedDict
@@ -104,7 +128,11 @@ class MilexAgent:
 
         # Loop detection
         self._last_tool_calls: List[str] = []
-        self._max_repeat_threshold: int = 3
+        self._max_repeat_threshold: int = 2
+        self._last_responses: List[str] = []
+        self._max_response_threshold: int = 2
+        self._consecutive_similar_count: int = 0
+        self._last_response_text: str = ""
 
         # Cache for model roles to avoid repeated dict lookups
         self._role_model_cache: Dict[str, str] = {}
@@ -112,6 +140,8 @@ class MilexAgent:
 
         # Multi-provider clients
         self._gemini_client = None
+        self._gemini_tools_cache = None
+        self._gemini_tools_hash = ""
 
     def start_background_tasks(self):
         """Must be called within an event loop."""
@@ -177,9 +207,9 @@ class MilexAgent:
     def _get_model_for_role(self, role: str) -> str:
         """Get model name for a role with caching."""
         if self._roles_dirty:
-            self._role_model_cache = self.config.get("roles", {})
+            self._role_model_cache = self.config.get("roles", {}).copy()
             self._roles_dirty = False
-        return self._role_model_cache.get(role, self.config["model"])
+        return self._role_model_cache.get(role, self.config.get("model", DEFAULT_CONFIG["model"]))
 
     def invalidate_role_cache(self):
         """Invalidate the role model cache after config changes."""
@@ -298,15 +328,20 @@ class MilexAgent:
         defaults = {
             "temperature": 0.7,
             "num_predict": 2048,
-            "num_ctx": 2048,  # Match config for CPU optimization
+            "temperature": self.config.get("temperature", 0.4),
+            "num_ctx": self.config.get("num_ctx", 8192),
+            "num_predict": self.config.get("max_tokens", 4096),
+            "top_p": 0.9,
+            "seed": 42,
         }
         try:
-            temp = override_temp if override_temp is not None else self.config.get("temperature", 0.7)
             options = {
-                "temperature": float(temp),
-                "num_predict": int(self.config.get("max_tokens", 2048)),
-                "num_ctx": int(self.config.get("num_ctx", 4096)),
+                "temperature": float(override_temp if override_temp is not None else defaults["temperature"]),
+                "num_predict": int(defaults["num_predict"]),
+                "num_ctx": int(defaults["num_ctx"]),
                 "repeat_penalty": float(self.config.get("repeat_penalty", 1.1)),
+                "top_p": float(defaults["top_p"]),
+                "seed": int(defaults["seed"]),
             }
             
             # CPU performance tuning: num_batch
@@ -344,6 +379,24 @@ class MilexAgent:
         # Check for phrase-level repetition (more expensive)
         return False
 
+    def _is_similar_response(self, text1: str, text2: str, threshold: float = 0.8) -> bool:
+        """Check if two responses are too similar (potential loop)."""
+        if not text1 or not text2:
+            return False
+        
+        # Simple word-based similarity
+        words1 = set(text1.lower().split())
+        words2 = set(text2.lower().split())
+        
+        if not words1 or not words2:
+            return False
+        
+        intersection = len(words1 & words2)
+        union = len(words1 | words2)
+        similarity = intersection / union if union > 0 else 0
+        
+        return similarity >= threshold
+
     # ── Public API (Async) ───────────────────────────────────────────────────
 
     async def chat(self, user_input: str) -> str:
@@ -351,6 +404,8 @@ class MilexAgent:
         self.conversation.append({"role": "user", "content": user_input})
         self._prune_history()
         self._last_tool_calls.clear()
+        self._last_responses.clear()
+        self._consecutive_similar_count = 0
 
         max_rounds = self.config.get("max_tool_rounds", 10)
         for _round in range(max_rounds):
@@ -366,6 +421,16 @@ class MilexAgent:
                 return response_text
 
             response_text, tool_calls = await self._call_model(messages)
+
+            # Check for response repetition
+            if self._last_response_text and self._is_similar_response(response_text, self._last_response_text):
+                self._consecutive_similar_count += 1
+                if self._consecutive_similar_count >= self._max_response_threshold:
+                    self.ui.print_warning(f"Detected repetitive responses ({self._consecutive_similar_count}x similar). Stopping to prevent loop.")
+                    break
+            else:
+                self._consecutive_similar_count = 0
+            self._last_response_text = response_text
 
             if tool_calls:
                 await self._process_tool_calls(response_text, tool_calls)
@@ -384,6 +449,8 @@ class MilexAgent:
         self.conversation.append({"role": "user", "content": user_input})
         self._prune_history()
         self._last_tool_calls.clear()
+        self._last_responses.clear()
+        self._consecutive_similar_count = 0
 
         max_rounds = self.config.get("max_tool_rounds", 10)
         for _round in range(max_rounds):
@@ -399,6 +466,16 @@ class MilexAgent:
                 return response_text
 
             last_response = await self._unified_stream(messages, cache_key)
+
+            # Check for response repetition
+            if self._last_response_text and self._is_similar_response(last_response, self._last_response_text):
+                self._consecutive_similar_count += 1
+                if self._consecutive_similar_count >= self._max_response_threshold:
+                    self.ui.print_warning(f"Detected repetitive responses ({self._consecutive_similar_count}x similar). Stopping to prevent loop.")
+                    break
+            else:
+                self._consecutive_similar_count = 0
+            self._last_response_text = last_response
 
             # Continue loop if tools were executed
             if self.conversation and self.conversation[-1].get("role") == "tool":
@@ -442,22 +519,25 @@ class MilexAgent:
                                     tool_calls_dict[tc_id] = tc
                             delta = msg.get("content", "")
                             if delta:
+                                if spinner:
+                                    spinner.stop()
+                                    spinner = None
                                 full_text += delta
                                 renderer.update(delta)
                                 if self._detect_streaming_loop(full_text):
                                     self.ui.print_warning("Streaming loop detected. Breaking.")
                                     break
-                    
+                        
                     elif provider == "gemini":
-                        # Directly use the member to assist type inference/linting if needed
                         await self._get_client("gemini")
                         g_client = self._gemini_client
                         if not g_client:
                             raise ValueError("Gemini client not initialized")
                             
+                        # Intelligent tool caching
                         tools_g = await self.executor.get_all_tools()
-                        gemini_tools = []
-                        if tools_g:
+                        tools_hash = str(hash(str(tools_g)))
+                        if self._gemini_tools_cache is None or self._gemini_tools_hash != tools_hash:
                             functions = []
                             for t in tools_g:
                                 f_decl = {
@@ -466,56 +546,66 @@ class MilexAgent:
                                     "parameters": self._clean_gemini_schema(t["function"]["parameters"])
                                 }
                                 functions.append(f_decl)
-                            gemini_tools = [{"function_declarations": functions}]
+                            self._gemini_tools_cache = [{"function_declarations": functions}] if functions else None
+                            self._gemini_tools_hash = tools_hash
                         
                         sys_instr = next((m["content"] for m in messages if m["role"] == "system"), None)
                         model_g = g_client.GenerativeModel(
                             model_name=model,
-                            tools=gemini_tools if gemini_tools else None,
+                            tools=self._gemini_tools_cache,
                             system_instruction=sys_instr
                         )
                         
-                        # Convert history
+                        # Faster history conversion
                         history = []
+                        last_role = None
                         for m in messages:
                             if m["role"] == "system": continue
-                            role = "user" if m["role"] in ("user", "tool") else "model"
+                            
+                            # Native role mapping
+                            # Gemini doesn't have 'tool' role in history, it expects user/model turns
+                            # with function calls and function responses.
+                            role = "user" if m["role"] == "user" else "model"
                             content = m.get("content") or ""
-                            history.append({"role": role, "parts": [content]})
+                            
+                            # Deduplicate sequential roles which Gemini dislikes
+                            if role == last_role and history:
+                                history[-1]["parts"].append(content)
+                            else:
+                                history.append({"role": role, "parts": [content]})
+                                last_role = role
                         
-                        current_msg = history.pop() if history else {"role": "user", "parts": [""]}
+                        current_msg = history.pop()["parts"][0] if history else ""
                         chat = model_g.start_chat(history=history if history else None)
                         
-                        response_stream = await chat.send_message_async(current_msg["parts"][0], stream=True)
+                        response_stream = await chat.send_message_async(current_msg, stream=True)
                         async for chunk in response_stream:
-                            # Handle text part safely
                             chunk_text = ""
                             try:
                                 chunk_text = chunk.text
-                            except (ValueError, IndexError):
-                                pass
+                            except (ValueError, IndexError): pass
                                 
                             if chunk_text:
+                                if spinner:
+                                    spinner.stop()
+                                    spinner = None
                                 full_text += chunk_text
                                 renderer.update(chunk_text)
                                 if self._detect_streaming_loop(full_text):
                                     self.ui.print_warning("Streaming loop detected. Breaking.")
                                     break
                             
-                            # Check for tool calls
                             if chunk.candidates and chunk.candidates[0].content.parts:
                                 for part in chunk.candidates[0].content.parts:
                                     if part.function_call:
                                         call = part.function_call
                                         tc_id = f"call_{hashlib.md5(call.name.encode()).hexdigest()[:8]}"
-                                        name = call.name
                                         args = dict(call.args)
                                         tool_calls_dict[tc_id] = {
                                             "id": tc_id,
-                                            "function": {"name": name, "arguments": json.dumps(args)}
+                                            "function": {"name": call.name, "arguments": json.dumps(args)}
                                         }
                 
-                # Close renderer and proceed
                 if spinner:
                     spinner.stop()
                     spinner = None
@@ -565,7 +655,7 @@ class MilexAgent:
                 call_dict["id"] = call_id
             clean_calls.append(call_dict)
 
-        # Detect loop
+        # Detect loop - lower threshold for faster detection
         current_batch_hash = "|".join(sorted(unique_call_hashes))
         
         # We check the last N tool call batches for repetitions
@@ -649,7 +739,7 @@ class MilexAgent:
                 write_res = await self.executor.execute_async("write_file", {"path": final_filename, "content": code})
                 if "success" in write_res:
                     self.ui.print_success(f"Saved to {final_filename}")
-                    if language.lower() in ("python", "bash", "sh") and self.ui.ask_run_command(final_filename):
+                    if language.lower() in ("python", "bash", "sh") and (self.config.get("auto_execute") or self.ui.ask_run_command(final_filename)):
                         cmd = f"python3 {final_filename}" if language.lower() == "python" else f"bash {final_filename}"
                         run_res = await self.executor.execute_async("run_shell", {"command": cmd})
                         return {"success": True, "filename": final_filename, "run_result": run_res}
@@ -692,9 +782,27 @@ class MilexAgent:
             self._response_cache.popitem(last=False)
 
     def _build_messages(self) -> List[Dict]:
-        pk = "compact_system_prompt" if self.config.get("compact_mode") else "system_prompt"
-        messages = [{"role": "system", "content": self.config.get(pk, self.config["system_prompt"])}]
-        messages.extend(self.conversation)
+        """Convert conversation history to provider-neutral message list with compact mode support."""
+        messages = []
+        
+        # Select appropriate system prompt based on mode
+        use_compact = self.config.get("compact_mode", False)
+        prompt_key = "compact_system_prompt" if use_compact else "system_prompt"
+        sys_prompt = str(self.config.get(prompt_key, DEFAULT_CONFIG[prompt_key]))
+        
+        # Inject context information (CWD, user, etc.) into system prompt to make it even more agentic
+        try:
+            user_name = os.getlogin()
+        except Exception:
+            user_name = os.environ.get("USER", "user")
+            
+        context_info = f"\n\nCURRENT CONTEXT:\n- CWD: {os.getcwd()}\n- USER: {user_name}"
+        messages.append({"role": "system", "content": sys_prompt + context_info})
+        
+        for m in self.conversation:
+            if m.get("role") == "system": continue # Avoid duplication
+            messages.append(m)
+            
         return messages
 
     async def _call_model(self, messages: List[Dict]) -> Tuple[str, List]:
