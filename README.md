@@ -41,11 +41,8 @@ MILEX is a powerful command-line interface that leverages **Ollama local models*
 ## Installation
 
 ```bash
-# Install dependencies
-pip install -r requirements.txt
-
-# Install as CLI tool
-pip install -e .
+# Install as a CLI tool (Editable mode)
+python3 -m pip install -e . --break-system-packages
 
 # Or run directly
 python -m milex.cli
@@ -79,10 +76,9 @@ milex --auto
 
 ## Slash Commands
 
-| Command | Description |
-|---------|-------------|
 | `/help` | Show all commands |
 | `/clear` | Clear conversation history |
+| `/burp` | Configure Burp Suite proxy (on/off/URL) |
 | `/model <name>` | Switch Ollama model |
 | `/models` | List available models |
 | `/config` | Show configuration |
@@ -93,6 +89,16 @@ milex --auto
 | `/sysinfo` | Show system information |
 | `/save <file>` | Save conversation |
 | `/exit` | Exit MILEX |
+
+---
+
+## 🛡️ Burp Suite Integration
+
+MILEX is built for security researchers and includes a native **Burp Suite Proxy** mode for intercepting its own web research (DuckDuckGo/Wikipedia/RAG) traffic.
+
+- **Toggle Interception**: Use `/burp on` or `/burp off` in the CLI.
+- **Custom Proxy**: Set a custom URL with `/burp http://127.0.0.1:8081`.
+- **SSL Handling**: When enabled, MILEX automatically bypasses SSL verification to work seamlessly with Burp's CA certificate.
 
 ---
 
@@ -138,7 +144,11 @@ Config is stored at `~/.milex/config.json`:
   "ollama_host": "http://localhost:11434",
   "temperature": 0.7,
   "max_tokens": 8192,
-  "auto_execute": false,
+  "auto_execute": true,
+  "burp_proxy": {
+    "enabled": false,
+    "proxy_url": "http://127.0.0.1:8080"
+  },
   "stream": true
 }
 ```
