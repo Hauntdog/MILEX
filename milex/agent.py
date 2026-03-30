@@ -95,25 +95,20 @@ class MilexAgent:
         )
         
         # Configure proxy for Ollama
-        client_kwargs = {"host": self.config["ollama_host"]}
         proxy_cfg = self.config.get("burp_proxy", {})
         if proxy_cfg.get("enabled"):
             proxy_url = proxy_cfg.get("proxy_url", "http://127.0.0.1:8080")
-            # Create a custom httpx client with proxy
             self.ui.print_info(f"Burp Suite proxy enabled: [cyan]{proxy_url}[/]")
-            # ollama.AsyncClient uses httpx.AsyncClient internally. 
-            # We can pass a custom client if needed, but the library also honors HTTP_PROXY environment variables.
-            # For more control, we'll manually set the proxy in the httpx client.
-            transport = httpx.AsyncHTTPTransport(proxy=proxy_url, verify=False)
-            async_client = httpx.AsyncClient(transport=transport, timeout=httpx.Timeout(120.0))
-            self._client = ollama.AsyncClient(host=self.config["ollama_host"], client=async_client)
             
-            # Set environment variables for other libraries (like Gemini SDK)
+            # Use environment variables for the httpx client to pickup proxies automatically
+            # This is the most compatible way across different 'ollama-python' versions
             os.environ["HTTP_PROXY"] = proxy_url
             os.environ["HTTPS_PROXY"] = proxy_url
-            # Disable SSL verification for requests/httpx via environment if possible 
-            # (though we handled it explicitly where we could)
+            os.environ["NO_PROXY"] = "localhost,127.0.0.1"
             os.environ["CURL_CA_BUNDLE"] = "" 
+            
+            # Simple initialization - Ollama uses these environment variables by default
+            self._client = ollama.AsyncClient(host=self.config["ollama_host"])
         else:
             self._client = ollama.AsyncClient(host=self.config["ollama_host"])
             
